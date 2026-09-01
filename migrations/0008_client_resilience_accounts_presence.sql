@@ -1,0 +1,3 @@
+-- Intentionally empty compatibility marker.
+-- The active ExcelSync 1.4.0 schema migration is 0008_resilience_accounts_presence.sql.
+-- This file was superseded before any local or remote migration apply.

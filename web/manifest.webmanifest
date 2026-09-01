@@ -1,0 +1,9 @@
+{
+  "name": "Personal Cloud",
+  "short_name": "Personal Cloud",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#f5f7fb",
+  "icons": []
+}

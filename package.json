@@ -1,0 +1,105 @@
+{
+  "name": "excel-sync",
+  "version": "1.4.1",
+  "private": true,
+  "description": "Windows multi-user file workspace backed by Cloudflare D1 and pluggable storage",
+  "main": "out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bridge:build": "node scripts/build-telegram-storage-bridge.cjs",
+    "package:win": "npm run bridge:build && npm run build && electron-builder --win nsis portable --config.directories.output=installer-dist --config.electronDist=node_modules/electron/dist",
+    "package:dir": "npm run bridge:build && npm run build && electron-builder --win dir --config.electronDist=node_modules/electron/dist",
+    "package:verify-signatures": "node scripts/verify-windows-signatures.cjs",
+    "relocate:dq": "node scripts/relocate-sync-root-to-dq.cjs",
+    "rebase:dq": "node scripts/rebase-sync-root-to-dq.cjs",
+    "start:packaged": "node scripts/start-packaged.cjs",
+    "runtime-worker:start": "node scripts/start-runtime-worker.cjs",
+    "runtime-worker:stop": "node scripts/stop-runtime-worker.cjs",
+    "desktop:upgrade:1.4.1": "node scripts/desktop-upgrade-1.4.1.cjs",
+    "cleanup:old-builds": "node scripts/cleanup-old-builds.cjs",
+    "worker:types": "wrangler types",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler deploy",
+    "worker:deploy:dry": "wrangler deploy --dry-run",
+    "d1:migrate:local": "wrangler d1 migrations apply excel-sync --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply excel-sync --remote",
+    "check": "npm run typecheck && npm test && npm run build && npm run worker:deploy:dry",
+    "cf:whoami": "wrangler whoami"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "44.0.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^5.0.0",
+    "exceljs": "^4.4.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.7",
+    "vitest": "^4.0.3",
+    "wrangler": "^4.120.1"
+  },
+  "build": {
+    "appId": "com.excelsync.desktop",
+    "npmRebuild": false,
+    "productName": "ExcelSync",
+    "asar": true,
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    },
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bridge-dist/telegram-storage-bridge.exe",
+        "to": "telegram-storage-bridge.exe"
+      },
+      {
+        "from": "scripts/telegram-storage-bridge.py",
+        "to": "telegram-storage-bridge.py"
+      }
+    ],
+    "win": {
+      "signExts": [
+        ".exe"
+      ],
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "artifactName": "ExcelSync-Setup-${version}-${arch}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "portable": {
+      "artifactName": "ExcelSync-Portable-${version}-${arch}.${ext}"
+    }
+  }
+}

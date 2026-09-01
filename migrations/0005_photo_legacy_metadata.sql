@@ -1,0 +1,3 @@
+-- Historical migration filename retained for D1 migration ordering compatibility.
+-- Personal photo metadata now belongs to the separate personal media SaaS and is
+-- intentionally not created or altered by fresh ExcelSync deployments.

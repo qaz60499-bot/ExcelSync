@@ -1,0 +1,2 @@
+-- One-time owner provisioning material was removed after successful execution.
+-- Never store plaintext credentials here.
