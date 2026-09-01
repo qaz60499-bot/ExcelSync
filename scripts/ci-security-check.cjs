@@ -31,7 +31,28 @@ for (const file of tracked) {
   for (const re of secretPatterns) if (re.test(text)) leaks.push(`${file}: ${re}`);
 }
 if (leaks.length) {
-  console.error('Possible committed secret material:\n' + leaks.join('\n'));
+  console.error(`Possible committed secret material detected in ${leaks.length} tracked-file match(es); values are intentionally not printed.`);
   process.exit(1);
 }
-console.log(`Security check PASS (${tracked.length} tracked files scanned)`);
+
+const historyNames = cp.execFileSync('git', ['log', '--all', '--name-only', '--pretty=format:'], {
+  encoding: 'utf8',
+  maxBuffer: 20 * 1024 * 1024,
+});
+const historicalPaths = [...new Set(historyNames.split(/\r?\n/).filter(Boolean))];
+const badHistoryFiles = historicalPaths.filter(f => forbiddenTracked.some(r => r.test(f.replace(/\\/g, '/'))));
+if (badHistoryFiles.length) {
+  console.error(`Forbidden sensitive-shaped filename detected in Git history (${badHistoryFiles.length} path(s)); names are intentionally not printed.`);
+  process.exit(1);
+}
+
+const historyPatch = cp.execFileSync('git', ['log', '-p', '--all', '--no-ext-diff', '--pretty=format:'], {
+  encoding: 'utf8',
+  maxBuffer: 50 * 1024 * 1024,
+});
+if (secretPatterns.some(re => re.test(historyPatch))) {
+  console.error('Secret-shaped material detected in Git history; matched values are intentionally not printed.');
+  process.exit(1);
+}
+
+console.log(`Security check PASS (${tracked.length} tracked files scanned; ${historicalPaths.length} historical paths checked; Git history secret-shape scan clean)`);
