@@ -36,7 +36,18 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: npm ci
-      - run: npm run package:win:ci
+      - name: Package Setup and Portable
+        shell: powershell
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Packaging attempt $attempt/$maxAttempts"
+            if (Test-Path ci-dist) { Remove-Item ci-dist -Recurse -Force }
+            npm run package:win:ci
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq $maxAttempts) { exit $LASTEXITCODE }
+            Start-Sleep -Seconds (10 * $attempt)
+          }
       - shell: powershell
         run: ./scripts/windows-package-smoke.ps1 -ArtifactsDir ci-dist
       - if: always()
@@ -55,6 +66,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
       - run: npm ci
+      - name: Create transaction report directory
+        shell: powershell
+        run: New-Item -ItemType Directory -Force test-artifacts/release-transaction | Out-Null
       - name: Auth, transaction, fault, permission and admin regression
         run: >-
           npx vitest run

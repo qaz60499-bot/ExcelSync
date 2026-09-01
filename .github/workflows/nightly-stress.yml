@@ -13,7 +13,7 @@ permissions:
   contents: read
 jobs:
   daily-baseline:
-    if: ${{ github.event_name != 'schedule' || github.event.schedule == '25 9 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '25 9 * * *') || (github.event_name == 'workflow_dispatch' && inputs.file_count == '') }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +21,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 90
     env:
-      EXCELSYNC_STRESS_FILES: ${{ inputs.file_count || matrix.file_count }}
+      EXCELSYNC_STRESS_FILES: ${{ matrix.file_count }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,7 +30,9 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Queue/restart stress
-        run: npx vitest run tests/queue-stress-e2e.test.ts tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose
+        run: npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose
+      - name: Queue priority and durable DB regression
+        run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
       - name: Upload stress report
         if: always()
         uses: actions/upload-artifact@v4
@@ -39,6 +41,33 @@ jobs:
           path: test-artifacts/stress/**
           if-no-files-found: warn
           retention-days: 14
+
+  custom-stress:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.file_count != '' }}
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      EXCELSYNC_STRESS_FILES: ${{ inputs.file_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Custom queue/restart stress
+        run: npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose
+      - name: Queue priority and durable DB regression
+        run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
+      - name: Upload stress report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-${{ env.EXCELSYNC_STRESS_FILES }}-${{ github.run_id }}
+          path: test-artifacts/stress/**
+          if-no-files-found: warn
+          retention-days: 30
+
   weekly-1000:
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '25 10 * * 0' }}
     runs-on: windows-2025
@@ -53,7 +82,9 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Weekly 1000-file queue/restart stress
-        run: npx vitest run tests/queue-stress-e2e.test.ts tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose
+        run: npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose
+      - name: Queue priority and durable DB regression
+        run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
       - name: Upload stress report
         if: always()
         uses: actions/upload-artifact@v4
