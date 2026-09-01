@@ -43,7 +43,7 @@ npx cap sync ios
 
 `.github/workflows/ios-build.yml` runs on `macos-26`.
 
-Without Apple signing secrets, it still compiles an unsigned iOS Simulator `.app` artifact. With all signing secrets present, it additionally archives and exports a signed `.ipa`.
+Without Apple signing secrets, it compiles both an unsigned iOS Simulator `.app` artifact and an unsigned iphoneos `.ipa` for alternative installers such as TrollStore. With all signing secrets present, it additionally archives and exports a conventionally signed `.ipa`.
 
 Required repository secrets for a signed IPA:
 
@@ -55,4 +55,4 @@ Required repository secrets for a signed IPA:
 
 The provisioning profile must cover bundle ID `com.excelsync.ios`.
 
-Pushing an `ios-v*` tag with signing configured publishes the resulting IPA to the matching GitHub Release.
+Pushing an `ios-v*` tag publishes the unsigned IPA when signing is absent, or the signed IPA when signing is configured, to the matching GitHub Release.
