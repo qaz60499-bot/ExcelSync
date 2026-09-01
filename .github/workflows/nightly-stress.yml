@@ -33,6 +33,10 @@ jobs:
         run: npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose
       - name: Queue priority and durable DB regression
         run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
+      - name: Print stress report
+        if: always()
+        shell: powershell
+        run: if (Test-Path test-artifacts/stress/test-report.json) { Get-Content test-artifacts/stress/test-report.json }
       - name: Upload stress report
         if: always()
         uses: actions/upload-artifact@v4
@@ -59,6 +63,10 @@ jobs:
         run: npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose
       - name: Queue priority and durable DB regression
         run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
+      - name: Print stress report
+        if: always()
+        shell: powershell
+        run: if (Test-Path test-artifacts/stress/test-report.json) { Get-Content test-artifacts/stress/test-report.json }
       - name: Upload stress report
         if: always()
         uses: actions/upload-artifact@v4
@@ -85,6 +93,10 @@ jobs:
         run: npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose
       - name: Queue priority and durable DB regression
         run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
+      - name: Print stress report
+        if: always()
+        shell: powershell
+        run: if (Test-Path test-artifacts/stress/test-report.json) { Get-Content test-artifacts/stress/test-report.json }
       - name: Upload stress report
         if: always()
         uses: actions/upload-artifact@v4

@@ -1,8 +1,9 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { assertSupportedFileSignature, isExcelTempFile, isManagedFile, isOfficeLockFile, officeLockTargetPath, sha256File, waitForStableReadableFile } from '../src/main/file-utils'
+import { ExcelWatcher } from '../src/main/watcher'
 import { FILE_CATEGORY_LABELS, FILE_PARTITIONS, fileCategoryForName, filePartitionForName, filePartitionLabel, mimeForFileName } from '../src/shared/file-types'
 
 const roots: string[] = []
@@ -77,5 +78,57 @@ describe('file utilities', () => {
     const stable = await waitForStableReadableFile(path, { stableMs: 5, attempts: 4 })
     expect(stable.size).toBe(128)
     expect(stable.mtimeMs).toBeGreaterThan(0)
+  })
+
+  it('handles Unicode, emoji, spaces and a deep directory with deterministic hashing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'excelsync-unicode-'))
+    roots.push(root)
+    const directory = join(root, ...Array.from({ length: 18 }, (_, i) => `层级 ${i}`))
+    await mkdir(directory, { recursive: true })
+    const path = join(directory, '财务 📊 终稿.xlsx')
+    await writeFile(path, Buffer.from('same-content'))
+    const first = await sha256File(path)
+    const stable = await waitForStableReadableFile(path, { stableMs: 5, attempts: 4 })
+    expect(first).toBe(await sha256File(path))
+    expect(stable.size).toBe(Buffer.byteLength('same-content'))
+  })
+
+  it('reads a read-only managed file without corrupting stability detection', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'excelsync-readonly-'))
+    roots.push(root)
+    const path = join(root, 'readonly.xlsx')
+    await writeFile(path, Buffer.alloc(64, 3))
+    await chmod(path, 0o444)
+    const stable = await waitForStableReadableFile(path, { stableMs: 5, attempts: 4 })
+    expect(stable.size).toBe(64)
+  })
+
+  it('fails deterministically when a file disappears before stability is established', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'excelsync-disappear-'))
+    roots.push(root)
+    const path = join(root, 'gone.xlsx')
+    await expect(waitForStableReadableFile(path, { stableMs: 5, attempts: 2 })).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('debounces duplicate watcher add/change events into one ready callback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'excelsync-watcher-'))
+    roots.push(root)
+    const ready: string[] = []
+    const watcher = new ExcelWatcher({
+      async onFileReady(path) { ready.push(path) },
+      async onFileDeleted() {}
+    })
+    try {
+      await watcher.start(root)
+      const path = join(root, 'duplicate.xlsx')
+      await writeFile(path, Buffer.from('v1'))
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      await writeFile(path, Buffer.from('v2'))
+      await writeFile(path, Buffer.from('v3'))
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+      expect(ready.filter((item) => item === path)).toHaveLength(1)
+    } finally {
+      await watcher.stop()
+    }
   })
 })
