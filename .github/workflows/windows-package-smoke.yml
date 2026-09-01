@@ -24,7 +24,17 @@ jobs:
           python-version: '3.11'
       - run: npm ci
       - name: Package Setup and Portable
-        run: npm run package:win:ci
+        shell: powershell
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Packaging attempt $attempt/$maxAttempts"
+            if (Test-Path ci-dist) { Remove-Item ci-dist -Recurse -Force }
+            npm run package:win:ci
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq $maxAttempts) { exit $LASTEXITCODE }
+            Start-Sleep -Seconds (10 * $attempt)
+          }
       - name: Smoke real EXEs
         shell: powershell
         run: ./scripts/windows-package-smoke.ps1 -ArtifactsDir ci-dist

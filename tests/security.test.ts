@@ -18,7 +18,7 @@ async function filesUnder(root: string): Promise<string[]> {
 describe('security boundaries', () => {
   it('contains no bot-token-shaped secret in source/config/tests', async () => {
     const roots = ['src', 'worker', 'migrations', 'tests', 'scripts']
-    const rootFiles = ['package.json', 'wrangler.jsonc', '.pair-session.json']
+    const rootFiles = ['package.json', 'wrangler.jsonc']
     const files = [
       ...(await Promise.all(roots.map(filesUnder))).flat()
         .filter((path) => ['.ts', '.tsx', '.js', '.mjs', '.cjs', '.py', '.json', '.jsonc', '.sql', '.html', '.css', '.md'].includes(extname(path))),

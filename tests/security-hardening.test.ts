@@ -37,8 +37,8 @@ describe('security hardening regressions', () => {
       expect(text).not.toContain('.pair-session.json')
       expect(text).not.toContain('Bearer ')
     }
-    const session = await readFile(new URL('../.pair-session.json', import.meta.url), 'utf8')
-    expect(JSON.parse(session)).toEqual({})
+    const gitignore = await readFile(new URL('../.gitignore', import.meta.url), 'utf8')
+    expect(gitignore.split(/\r?\n/)).toContain('.pair-session.json')
   })
 
   it('requires exact legacy Telegram pairing codes and limits anonymous health detail', async () => {
