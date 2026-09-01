@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { afterEach, describe, expect, it } from 'vitest'
 import { LocalDb } from '../src/main/db'
 
@@ -92,6 +93,7 @@ describe('Sync priority queue', () => {
   })
 
   it('handles a 1000-item mixed-priority queue and repeatedly selects distinct ready files', async () => {
+    const started = performance.now()
     const db = await makeDb()
     for (let index = 0; index < 1000; index += 1) {
       const file = makeFile(db, 1000 + index)
@@ -111,5 +113,6 @@ describe('Sync priority queue', () => {
     expect(db.nextReadyPending()?.priority).toBe(0)
     expect(db.db.prepare('SELECT COUNT(*) AS count FROM pending_sync WHERE priority = 4').get() as { count: number }).toMatchObject({ count: expect.any(Number) })
     db.close()
-  })
+    expect(performance.now() - started).toBeLessThan(25_000)
+  }, 30_000)
 })
