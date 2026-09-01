@@ -80,7 +80,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx electron-builder --win nsis portable --publish never --config.directories.output=security-dist --config.electronDist=node_modules/electron/dist
+          npx electron-builder --win nsis portable --publish never --config.directories.output=security-dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Scan build and unpacked resources for sensitive material
