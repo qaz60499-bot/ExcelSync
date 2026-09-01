@@ -1,0 +1,39 @@
+name: Windows Package Smoke
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npm ci
+      - name: Package Setup and Portable
+        run: npm run package:win:ci
+      - name: Smoke real EXEs
+        shell: powershell
+        run: ./scripts/windows-package-smoke.ps1 -ArtifactsDir ci-dist
+      - name: Upload package smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-smoke-${{ matrix.os }}
+          path: |
+            test-artifacts/package-smoke/**
+            ci-dist/*.exe
+          retention-days: 7

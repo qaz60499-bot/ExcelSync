@@ -1,0 +1,68 @@
+name: Windows CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Create report directory
+        shell: powershell
+        run: New-Item -ItemType Directory -Force test-artifacts/windows-ci | Out-Null
+      - id: security
+        name: Committed secret guard
+        continue-on-error: true
+        run: node scripts/ci-security-check.cjs
+      - id: typecheck
+        name: Typecheck
+        continue-on-error: true
+        run: npm run typecheck
+      - id: unit
+        name: Unit tests
+        continue-on-error: true
+        run: npx vitest run --reporter=verbose --reporter=json --outputFile.json=test-artifacts/windows-ci/vitest.json
+      - name: Unit report
+        if: always()
+        continue-on-error: true
+        run: node scripts/ci-vitest-report.cjs --input=test-artifacts/windows-ci/vitest.json --suite="Windows Unit" --output-dir=test-artifacts/windows-ci
+      - id: build
+        name: Build
+        continue-on-error: true
+        run: npm run build
+      - id: worker
+        name: Worker dry-run
+        continue-on-error: true
+        run: npm run worker:deploy:dry
+      - name: Upload CI report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ci-${{ matrix.os }}
+          path: test-artifacts/windows-ci/**
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce Windows CI gate
+        if: always()
+        shell: powershell
+        run: |
+          $failed = @()
+          if ('${{ steps.security.outcome }}' -ne 'success') { $failed += 'security' }
+          if ('${{ steps.typecheck.outcome }}' -ne 'success') { $failed += 'typecheck' }
+          if ('${{ steps.unit.outcome }}' -ne 'success') { $failed += 'unit' }
+          if ('${{ steps.build.outcome }}' -ne 'success') { $failed += 'build' }
+          if ('${{ steps.worker.outcome }}' -ne 'success') { $failed += 'worker-dry-run' }
+          if ($failed.Count) { throw "Windows CI gate failed: $($failed -join ', ')" }

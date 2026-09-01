@@ -8,6 +8,8 @@ installer-dist/
 mobile/ios/
 mobile/.vite/
 coverage/
+test-artifacts/
+ci-dist/
 __pycache__/
 *.pyc
 .wrangler/

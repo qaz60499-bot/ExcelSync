@@ -1,0 +1,63 @@
+name: Self-hosted Windows Soak
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '40 8 * * 0'
+permissions:
+  contents: read
+jobs:
+  public-repo-safety:
+    runs-on: windows-2025
+    steps:
+      - name: Report self-hosted eligibility
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force test-artifacts/self-hosted | Out-Null
+          if ('${{ github.event.repository.private }}' -ne 'true') {
+            '{"conclusion":"BLOCKED","reason":"Self-hosted ExcelSync runner is intentionally disabled for public repositories."}' | Set-Content test-artifacts/self-hosted/test-report.json
+            Write-Host 'BLOCKED: public repository; self-hosted VPS will not be scheduled.'
+          } else {
+            '{"conclusion":"ELIGIBLE"}' | Set-Content test-artifacts/self-hosted/test-report.json
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: self-hosted-safety-${{ github.run_id }}
+          path: test-artifacts/self-hosted/**
+          retention-days: 14
+  soak:
+    if: ${{ github.event.repository.private == true }}
+    needs: public-repo-safety
+    runs-on: [self-hosted, windows, x64, excelsync-e2e]
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Runner and Office inventory
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force test-artifacts/self-hosted | Out-Null
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber | ConvertTo-Json | Set-Content test-artifacts/self-hosted/windows.json
+          $excel = Get-Command EXCEL.EXE -ErrorAction SilentlyContinue
+          if ($excel) { $excel | Select-Object Source,Version | ConvertTo-Json | Set-Content test-artifacts/self-hosted/excel.json }
+          else { '{"installed":false}' | Set-Content test-artifacts/self-hosted/excel.json }
+      - name: Long-run local correctness baseline
+        run: npx vitest run tests/sync-engine.test.ts tests/db.test.ts tests/queue-priority.test.ts tests/state-machine-abuse.test.ts tests/queue-stress-e2e.test.ts --reporter=verbose
+        env:
+          EXCELSYNC_STRESS_FILES: '1000'
+      - name: Package real EXEs into isolated CI output
+        run: npm run package:win:ci
+      - name: Packaged smoke
+        shell: powershell
+        run: ./scripts/windows-package-smoke.ps1 -ArtifactsDir ci-dist -ReportDir test-artifacts/self-hosted/package-smoke
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-hosted-soak-${{ github.run_id }}
+          path: test-artifacts/self-hosted/**
+          if-no-files-found: warn
+          retention-days: 30

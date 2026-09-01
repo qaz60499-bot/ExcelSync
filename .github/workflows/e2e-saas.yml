@@ -1,0 +1,38 @@
+name: SaaS E2E (Staging Only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  staging-e2e:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+      E2E_USERNAME: ${{ secrets.E2E_USERNAME }}
+      E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+      E2E_STAGING_CONFIRMATION: ${{ secrets.E2E_STAGING_CONFIRMATION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - id: e2e
+        name: Staging auth + file transaction E2E
+        continue-on-error: true
+        run: node scripts/staging-saas-e2e.mjs
+      - name: Upload staging report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saas-e2e-${{ github.run_id }}
+          path: test-artifacts/saas-e2e/**
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce staging E2E gate
+        if: always()
+        shell: powershell
+        run: |
+          if ('${{ steps.e2e.outcome }}' -ne 'success') { throw 'SaaS staging E2E failed or is BLOCKED; inspect the uploaded report.' }

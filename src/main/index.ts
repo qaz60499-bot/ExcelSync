@@ -1454,6 +1454,14 @@ async function initialize(): Promise<void> {
   installChineseApplicationMenu()
   createTray()
   await syncEngine.start(localDb.getSettings())
+
+  const e2eAutoQuitArg = process.argv.find((arg) => arg.startsWith('--e2e-auto-quit-ms='))
+  if (e2eAutoQuitArg) {
+    const delayMs = Number.parseInt(e2eAutoQuitArg.slice('--e2e-auto-quit-ms='.length), 10)
+    if (Number.isFinite(delayMs) && delayMs >= 1000 && delayMs <= 120_000) {
+      setTimeout(() => app.quit(), delayMs).unref()
+    }
+  }
 }
 
 const gotLock = app.requestSingleInstanceLock()

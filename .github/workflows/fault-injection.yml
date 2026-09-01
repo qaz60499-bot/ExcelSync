@@ -1,0 +1,50 @@
+name: Fault Injection
+on:
+  workflow_dispatch:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  deterministic-faults:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Create report directory
+        shell: powershell
+        run: New-Item -ItemType Directory -Force test-artifacts/fault-injection | Out-Null
+      - id: faults
+        name: HTTP/network/upload/commit/restart fault suite
+        continue-on-error: true
+        run: >-
+          npx vitest run
+          tests/api-fault-injection.test.ts
+          tests/sync-engine.test.ts
+          tests/state-machine-abuse.test.ts
+          tests/telegram-storage.test.ts
+          tests/login-security.test.ts
+          tests/security-bruteforce-boundary.test.ts
+          --reporter=verbose --reporter=json
+          --outputFile.json=test-artifacts/fault-injection/vitest.json
+      - name: Build fault report
+        if: always()
+        continue-on-error: true
+        run: node scripts/ci-vitest-report.cjs --input=test-artifacts/fault-injection/vitest.json --suite="Fault Injection" --output-dir=test-artifacts/fault-injection
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fault-injection-${{ github.run_id }}
+          path: test-artifacts/fault-injection/**
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce fault gate
+        if: always()
+        shell: powershell
+        run: |
+          if ('${{ steps.faults.outcome }}' -ne 'success') { throw 'Fault injection suite failed' }

@@ -14,6 +14,7 @@
     "test:watch": "vitest",
     "bridge:build": "node scripts/build-telegram-storage-bridge.cjs",
     "package:win": "npm run bridge:build && npm run build && electron-builder --win nsis portable --config.directories.output=installer-dist --config.electronDist=node_modules/electron/dist",
+    "package:win:ci": "npm run bridge:build && npm run build && electron-builder --win nsis portable --config.directories.output=ci-dist --config.electronDist=node_modules/electron/dist",
     "package:dir": "npm run bridge:build && npm run build && electron-builder --win dir --config.electronDist=node_modules/electron/dist",
     "package:verify-signatures": "node scripts/verify-windows-signatures.cjs",
     "relocate:dq": "node scripts/relocate-sync-root-to-dq.cjs",
