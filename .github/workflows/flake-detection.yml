@@ -1,0 +1,69 @@
+name: Flake Detection
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  repeat-and-order:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Committed secret guard
+        run: node scripts/ci-security-check.cjs
+      - name: Standalone sync suite
+        run: npx vitest run tests/sync-engine.test.ts --reporter=verbose --no-file-parallelism
+      - name: Standalone security suites
+        run: npx vitest run tests/security.test.ts tests/security-hardening.test.ts tests/login-security.test.ts tests/security-bruteforce-boundary.test.ts tests/state-machine-abuse.test.ts --reporter=verbose --no-file-parallelism
+      - name: Standalone queue and DB suites
+        run: npx vitest run tests/queue-priority.test.ts tests/db.test.ts --reporter=verbose --no-file-parallelism
+      - name: Queue priority repeat x5
+        shell: powershell
+        run: |
+          1..5 | ForEach-Object {
+            Write-Host "queue-priority repeat $_/5"
+            npx vitest run tests/queue-priority.test.ts --reporter=verbose --no-file-parallelism
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Sync engine repeat x5
+        shell: powershell
+        run: |
+          1..5 | ForEach-Object {
+            Write-Host "sync-engine repeat $_/5"
+            npx vitest run tests/sync-engine.test.ts --reporter=verbose --no-file-parallelism
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: State machine abuse repeat x5
+        shell: powershell
+        run: |
+          1..5 | ForEach-Object {
+            Write-Host "state-machine repeat $_/5"
+            npx vitest run tests/state-machine-abuse.test.ts --reporter=verbose --no-file-parallelism
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Queue restart repeat x3
+        shell: powershell
+        run: |
+          $env:EXCELSYNC_STRESS_FILES = '50'
+          1..3 | ForEach-Object {
+            Write-Host "queue/restart repeat $_/3"
+            npx vitest run tests/queue-stress-e2e.test.ts --reporter=verbose --no-file-parallelism
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Upload flake artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-detection-${{ matrix.os }}-${{ github.run_id }}
+          path: test-artifacts/**
+          if-no-files-found: warn
+          retention-days: 14

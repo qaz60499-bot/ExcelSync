@@ -54,12 +54,15 @@ try {
   if (-not $setup -or -not $portable) { Fail-Step 'artifacts-present' "Setup or Portable artifact missing in $ArtifactsDir" }
   Add-Result 'artifacts-present' 'PASS' "$($setup.Name); $($portable.Name)"
 
-  Run-App $portable.FullName 'portable-first-start'
-  if (-not (Test-Path (Join-Path $env:EXCELSYNC_USER_DATA_DIR 'state\excel-sync.sqlite'))) {
-    Fail-Step 'portable-local-state' 'state/excel-sync.sqlite was not initialized'
+  for ($i = 1; $i -le 5; $i++) {
+    Run-App $portable.FullName "portable-start-$i"
+    if ($i -eq 1) {
+      if (-not (Test-Path (Join-Path $env:EXCELSYNC_USER_DATA_DIR 'state\excel-sync.sqlite'))) {
+        Fail-Step 'portable-local-state' 'state/excel-sync.sqlite was not initialized'
+      }
+      Add-Result 'portable-local-state' 'PASS' 'SQLite initialized in isolated E2E userData'
+    }
   }
-  Add-Result 'portable-local-state' 'PASS' 'SQLite initialized in isolated E2E userData'
-  Run-App $portable.FullName 'portable-second-start'
 
   if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue }
   $installer = Start-Process -FilePath $setup.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru -Wait
@@ -73,8 +76,9 @@ try {
   if (Test-Path $desktopShortcut) { Add-Result 'desktop-shortcut' 'PASS' $desktopShortcut } else { Add-Result 'desktop-shortcut' 'FAIL' 'ExcelSync.lnk not found on Desktop' }
   if (Test-Path $startShortcut) { Add-Result 'start-menu-shortcut' 'PASS' $startShortcut } else { Add-Result 'start-menu-shortcut' 'FAIL' 'ExcelSync.lnk not found in Start Menu' }
 
-  Run-App $installedExe 'installed-first-start'
-  Run-App $installedExe 'installed-second-start'
+  for ($i = 1; $i -le 5; $i++) {
+    Run-App $installedExe "installed-start-$i"
+  }
 
   $uninstaller = Get-ChildItem $installDir -Filter 'Uninstall*.exe' | Select-Object -First 1
   if (-not $uninstaller) { Fail-Step 'uninstaller-present' 'Uninstaller missing' }
@@ -84,8 +88,8 @@ try {
   Start-Sleep -Seconds 2
   Add-Result 'uninstall' 'PASS' 'exit=0'
 
-  if (Test-Path $installedExe) { Add-Result 'uninstall-install-dir-clean' 'FAIL' "installed EXE remained: $installedExe" }
-  else { Add-Result 'uninstall-install-dir-clean' 'PASS' 'installed EXE removed' }
+  if (Test-Path $installDir) { Add-Result 'uninstall-install-dir-clean' 'FAIL' "install directory remained: $installDir" }
+  else { Add-Result 'uninstall-install-dir-clean' 'PASS' 'install directory removed' }
   if (Test-Path $desktopShortcut) { Add-Result 'uninstall-desktop-shortcut-clean' 'FAIL' 'desktop shortcut remained' }
   else { Add-Result 'uninstall-desktop-shortcut-clean' 'PASS' 'desktop shortcut removed' }
   if (Test-Path $startShortcut) { Add-Result 'uninstall-start-shortcut-clean' 'FAIL' 'start menu shortcut remained' }
