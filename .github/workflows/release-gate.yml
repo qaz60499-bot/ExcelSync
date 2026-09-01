@@ -39,13 +39,25 @@ jobs:
       - name: Package Setup and Portable
         shell: powershell
         run: |
+          New-Item -ItemType Directory -Force test-artifacts/package-smoke | Out-Null
           $maxAttempts = 3
+          $networkPattern = '(?i)(ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|TLS|certificate.*timed|HTTP\s*5\d\d|download.*(failed|timeout)|electron.*(download|fetch))'
           for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             Write-Host "Packaging attempt $attempt/$maxAttempts"
             if (Test-Path ci-dist) { Remove-Item ci-dist -Recurse -Force }
-            npm run package:win:ci
-            if ($LASTEXITCODE -eq 0) { break }
-            if ($attempt -eq $maxAttempts) { exit $LASTEXITCODE }
+            $logPath = "test-artifacts/package-smoke/package-attempt-$attempt.log"
+            cmd.exe /d /s /c "npm run package:win:ci > `"$logPath`" 2>&1"
+            $exitCode = $LASTEXITCODE
+            $log = Get-Content $logPath -Raw
+            Write-Host $log
+            if ($exitCode -eq 0) { break }
+            $networkFailure = $log -match $networkPattern
+            if (-not $networkFailure) {
+              Write-Error "Packaging failed with a non-network error; refusing to retry."
+              exit $exitCode
+            }
+            if ($attempt -eq $maxAttempts) { exit $exitCode }
+            Write-Warning "Transient network-shaped packaging failure detected; retrying once the backoff expires."
             Start-Sleep -Seconds (10 * $attempt)
           }
       - shell: powershell
