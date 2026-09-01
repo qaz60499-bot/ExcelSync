@@ -33,10 +33,11 @@ jobs:
             Write-Host "Packaging attempt $attempt/$maxAttempts"
             if (Test-Path ci-dist) { Remove-Item ci-dist -Recurse -Force }
             $logPath = "test-artifacts/package-smoke/package-attempt-$attempt.log"
-            npm run package:win:ci 2>&1 | Tee-Object -FilePath $logPath
+            cmd.exe /d /s /c "npm run package:win:ci > `"$logPath`" 2>&1"
             $exitCode = $LASTEXITCODE
-            if ($exitCode -eq 0) { break }
             $log = Get-Content $logPath -Raw
+            Write-Host $log
+            if ($exitCode -eq 0) { break }
             $networkFailure = $log -match $networkPattern
             if (-not $networkFailure) {
               Write-Error "Packaging failed with a non-network error; refusing to retry."
