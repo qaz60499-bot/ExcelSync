@@ -71,6 +71,53 @@ function retryableStatus(status: number): boolean {
 
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>
 
+const MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024
+
+async function readBoundedJson<T>(response: Response): Promise<T> {
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  if (!contentType.includes('application/json')) {
+    throw new ApiError('INVALID_RESPONSE_CONTENT_TYPE', 502, true)
+  }
+  const declaredLength = Number(response.headers.get('content-length') ?? 0)
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_RESPONSE_BYTES) {
+    throw new ApiError('RESPONSE_TOO_LARGE', 502, false)
+  }
+  if (!response.body) throw new ApiError('EMPTY_RESPONSE', 502, true)
+
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > MAX_JSON_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        throw new ApiError('RESPONSE_TOO_LARGE', 502, false)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  const text = new TextDecoder().decode(bytes)
+  if (!text.trim()) throw new ApiError('EMPTY_RESPONSE', 502, true)
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    throw new ApiError('INVALID_RESPONSE_JSON', 502, true)
+  }
+}
+
 export interface ClientIdentity {
   deviceName: string
   osName: string
@@ -150,7 +197,7 @@ export class WorkerApi {
     options: { auth?: boolean; setupNonce?: string; timeoutMs?: number } = { auth: true }
   ): Promise<T> {
     const response = await this.request(path, init, options)
-    return (await response.json()) as T
+    return readBoundedJson<T>(response)
   }
 
   async health(): Promise<{

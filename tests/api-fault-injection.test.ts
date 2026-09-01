@@ -40,7 +40,7 @@ describe('WorkerApi deterministic network fault mapping', () => {
     })
   }
 
-  for (const status of [400, 401, 403, 404, 413]) {
+  for (const status of [400, 401, 403, 404, 409, 413]) {
     it(`marks HTTP ${status} non-retryable`, async () => {
       const { api } = apiFor(async () => response(status))
       await expect(api.health()).rejects.toMatchObject({ status, retryable: false })
@@ -50,6 +50,38 @@ describe('WorkerApi deterministic network fault mapping', () => {
   it('maps connection reset / DNS-style fetch failures to retryable NETWORK_ERROR', async () => {
     const { api } = apiFor(async () => { throw new Error('ECONNRESET simulated') })
     await expect(api.health()).rejects.toMatchObject({ code: 'NETWORK_ERROR', status: 0, retryable: true })
+  })
+
+  it('fails closed on malformed, empty, wrong-content-type and oversized successful responses', async () => {
+    const malformed = apiFor(async () => new Response('{"ok":', { status: 200, headers: { 'content-type': 'application/json' } })).api
+    await expect(malformed.health()).rejects.toMatchObject({ code: 'INVALID_RESPONSE_JSON', retryable: true })
+
+    const empty = apiFor(async () => new Response('', { status: 200, headers: { 'content-type': 'application/json' } })).api
+    await expect(empty.health()).rejects.toMatchObject({ code: 'EMPTY_RESPONSE', retryable: true })
+
+    const wrongType = apiFor(async () => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'text/html' } })).api
+    await expect(wrongType.health()).rejects.toMatchObject({ code: 'INVALID_RESPONSE_CONTENT_TYPE', retryable: true })
+
+    const oversized = apiFor(async () => new Response('{"ok":true}', {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'content-length': String(2 * 1024 * 1024 + 1) }
+    })).api
+    await expect(oversized.health()).rejects.toMatchObject({ code: 'RESPONSE_TOO_LARGE', retryable: false })
+  })
+
+  it('honors request timeout without hanging indefinitely', async () => {
+    const api = new WorkerApi(
+      new MemorySessionStore() as any,
+      () => 'https://staging.example.test',
+      async (_input, init) => await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted by test timeout')), { once: true })
+      }),
+      () => ({ deviceName: 'E2E Windows', osName: 'win32', osVersion: 'test', clientVersion: '1.4.1' })
+    )
+    const started = Date.now()
+    await expect((api as any).json('/health', { method: 'GET' }, { auth: false, timeoutMs: 50 }))
+      .rejects.toMatchObject({ code: 'NETWORK_ERROR', retryable: true })
+    expect(Date.now() - started).toBeLessThan(2000)
   })
 
   it('clears an authenticated session on 401 without swallowing the failure', async () => {

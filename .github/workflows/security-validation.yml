@@ -1,0 +1,131 @@
+name: Security Validation
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+
+jobs:
+  security-validation:
+    name: Security ${{ matrix.os }} round-${{ matrix.round }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        round: [1, 2]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      HAS_STAGING_SECURITY: ${{ secrets.E2E_BASE_URL != '' && secrets.E2E_USERNAME != '' && secrets.E2E_PASSWORD != '' && secrets.E2E_STAGING_CONFIRMATION != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Create isolated security report directory
+        shell: powershell
+        run: New-Item -ItemType Directory -Force test-artifacts/security-validation | Out-Null
+
+      - name: Tracked files and Git history secret guard
+        run: node scripts/ci-security-check.cjs
+
+      - name: Dependency and supply-chain validation
+        run: node scripts/security-supply-chain-check.cjs test-artifacts/security-validation
+
+      - name: Native Windows filesystem boundary
+        shell: powershell
+        run: ./scripts/security-windows-filesystem.ps1 -ReportDir test-artifacts/security-validation/windows-filesystem
+
+      - name: Security boundary test suite
+        run: >-
+          npx vitest run
+          tests/security-validation.test.ts
+          tests/security-resource-exhaustion.test.ts
+          tests/path-security.test.ts
+          tests/file-utils.test.ts
+          tests/api-fault-injection.test.ts
+          tests/security-hardening.test.ts
+          tests/security.test.ts
+          tests/security-bruteforce-boundary.test.ts
+          tests/state-machine-abuse.test.ts
+          tests/auth.test.ts
+          tests/db.test.ts
+          tests/sync-engine.test.ts
+          --reporter=verbose
+          --reporter=json
+          --outputFile.json=test-artifacts/security-validation/vitest.json
+
+      - name: Typecheck after security changes
+        run: npm run typecheck
+
+      - name: Build application
+        run: npm run build
+
+      - name: Build Setup and Portable into isolated security output
+        shell: powershell
+        run: |
+          if (Test-Path security-dist) { Remove-Item security-dist -Recurse -Force }
+          npm run bridge:build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx electron-builder --win nsis portable --publish never --config.directories.output=security-dist --config.electronDist=node_modules/electron/dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Scan build and unpacked resources for sensitive material
+        run: node scripts/security-artifact-scan.cjs out bridge-dist security-dist/win-unpacked/resources
+
+      - name: Inspect packaged ASAR for sensitive files, sourcemaps, and secret-shaped content
+        run: node scripts/security-asar-inspect.cjs security-dist/win-unpacked/resources/app.asar test-artifacts/security-validation/asar-inspect
+
+      - name: Static inspect Setup and Portable
+        shell: powershell
+        run: ./scripts/security-package-inspect.ps1 -ArtifactsDir security-dist -ReportDir test-artifacts/security-validation/package-inspect
+
+      - name: Install, run, inspect shortcuts, and uninstall in isolated path
+        shell: powershell
+        run: ./scripts/windows-package-smoke.ps1 -ArtifactsDir security-dist -ReportDir test-artifacts/security-validation/package-smoke
+
+      - name: Staging security prerequisite status
+        if: matrix.os == 'windows-2025' && matrix.round == 1
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force test-artifacts/security-validation/staging | Out-Null
+          if ('${{ env.HAS_STAGING_SECURITY }}' -ne 'true') {
+            'STAGING SECURITY = BLOCKED' | Set-Content test-artifacts/security-validation/staging/status.txt -Encoding utf8
+            Write-Host 'STAGING SECURITY = BLOCKED'
+          } else {
+            'STAGING SECURITY = ELIGIBLE' | Set-Content test-artifacts/security-validation/staging/status.txt -Encoding utf8
+            Write-Host 'STAGING SECURITY = ELIGIBLE'
+          }
+
+      - name: Non-destructive staging auth boundary
+        if: matrix.os == 'windows-2025' && matrix.round == 1 && env.HAS_STAGING_SECURITY == 'true'
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_USERNAME: ${{ secrets.E2E_USERNAME }}
+          E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+          E2E_STAGING_CONFIRMATION: ${{ secrets.E2E_STAGING_CONFIRMATION }}
+        run: node scripts/staging-security-boundary.mjs
+
+      - name: Upload security validation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-validation-${{ matrix.os }}-round-${{ matrix.round }}-${{ github.run_id }}
+          path: |
+            test-artifacts/security-validation/**
+            security-dist/*.exe
+          if-no-files-found: warn
+          retention-days: 14

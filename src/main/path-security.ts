@@ -1,3 +1,4 @@
+import { lstatSync } from 'node:fs'
 import { isAbsolute, relative, resolve, win32 } from 'node:path'
 
 const WINDOWS_INVALID_SEGMENT_CHARS = /[<>:"|?*\u0000-\u001F]/
@@ -31,7 +32,24 @@ export function isPathWithinRoot(root: string, candidatePath: string): boolean {
 
 export function resolveWithinRoot(root: string, relativePath: string): string {
   const safe = safeRelativePath(relativePath)
-  const candidate = resolve(resolve(root), safe)
+  const normalizedRoot = resolve(root)
+  const candidate = resolve(normalizedRoot, safe)
   if (!isPathWithinRoot(root, candidate)) throw new Error('PATH_REJECTED')
+
+  // Lexical containment is not sufficient on Windows: a junction/symlink inside
+  // the managed root can redirect an otherwise-safe relative path outside it.
+  // Reject any existing reparse-style segment below the selected root.
+  const segments = safe.split('/')
+  for (let index = 0; index < segments.length; index += 1) {
+    const current = resolve(normalizedRoot, ...segments.slice(0, index + 1))
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error('PATH_REJECTED')
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') break
+      if (error instanceof Error && error.message === 'PATH_REJECTED') throw error
+      throw new Error('PATH_REJECTED')
+    }
+  }
   return candidate
 }

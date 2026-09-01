@@ -76,6 +76,15 @@ try {
   if (Test-Path $desktopShortcut) { Add-Result 'desktop-shortcut' 'PASS' $desktopShortcut } else { Add-Result 'desktop-shortcut' 'FAIL' 'ExcelSync.lnk not found on Desktop' }
   if (Test-Path $startShortcut) { Add-Result 'start-menu-shortcut' 'PASS' $startShortcut } else { Add-Result 'start-menu-shortcut' 'FAIL' 'ExcelSync.lnk not found in Start Menu' }
 
+  $wsh = New-Object -ComObject WScript.Shell
+  foreach ($shortcutPath in @($desktopShortcut, $startShortcut)) {
+    if (-not (Test-Path $shortcutPath)) { continue }
+    $shortcut = $wsh.CreateShortcut($shortcutPath)
+    if ($shortcut.TargetPath -ne $installedExe) { Fail-Step 'shortcut-target' "unexpected target: $($shortcut.TargetPath)" }
+    if (-not [string]::IsNullOrWhiteSpace($shortcut.Arguments)) { Fail-Step 'shortcut-arguments' "unexpected shortcut arguments present" }
+  }
+  Add-Result 'shortcut-target-and-arguments' 'PASS' 'shortcuts target the installed executable with no injected arguments'
+
   for ($i = 1; $i -le 5; $i++) {
     Run-App $installedExe "installed-start-$i"
   }

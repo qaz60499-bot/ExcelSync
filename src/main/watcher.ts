@@ -22,6 +22,7 @@ export class ExcelWatcher {
       persistent: true,
       ignoreInitial: false,
       awaitWriteFinish: false,
+      followSymlinks: false,
       depth: 20,
       ignored: (path, stats) => Boolean(stats?.isFile() && !isManagedFile(path) && !isOfficeLockFile(path))
     })

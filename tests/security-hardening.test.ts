@@ -64,6 +64,27 @@ describe('security hardening regressions', () => {
     expect(bridge).not.toContain('EXCELSYNC_TELEGRAM_SESSION",')
   })
 
+  it('keeps Electron navigation, IPC, external URL and CSP boundaries narrow', async () => {
+    const [main, preload, html] = await Promise.all([
+      readFile(new URL('../src/main/index.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/preload/index.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/renderer/index.html', import.meta.url), 'utf8')
+    ])
+    expect(main).toContain("if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error('IPC_SENDER_REJECTED')")
+    expect(main).toContain("if (!devOk && !packagedOk) throw new Error('IPC_ORIGIN_REJECTED')")
+    expect(main).toContain("window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))")
+    expect(main).toContain("window.webContents.on('will-navigate'")
+    expect(main).toContain("url.hostname !== 't.me'")
+    expect(main).toContain('webSecurity: true')
+    expect(preload).toContain('contextBridge.exposeInMainWorld')
+    expect(preload).not.toContain('shell.')
+    expect(preload).not.toContain('child_process')
+    expect(html).toContain("default-src 'self'")
+    expect(html).toContain("object-src 'none'")
+    expect(html).toContain("base-uri 'none'")
+    expect(html).toContain("frame-src 'none'")
+  })
+
   it('disables workers.dev and keeps signing verification optional for GitHub packaging', async () => {
     const wrangler = await readFile(new URL('../wrangler.jsonc', import.meta.url), 'utf8')
     const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
