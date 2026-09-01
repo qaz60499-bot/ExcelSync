@@ -77,15 +77,15 @@ describe('security boundaries', () => {
     expect(vite).toContain("entryFileNames: 'index.cjs'")
   })
 
-  it('retires destructive legacy pairing scripts and leaves no plaintext pair session', async () => {
-    const [start, confirm, confirmAdmin, session] = await Promise.all([
+  it('retires destructive legacy pairing scripts and excludes plaintext pair sessions from source control', async () => {
+    const [start, confirm, confirmAdmin, gitignore] = await Promise.all([
       readFile('scripts/pair-start.mjs', 'utf8'),
       readFile('scripts/pair-confirm.mjs', 'utf8'),
       readFile('scripts/pair-confirm-admin.mjs', 'utf8'),
-      readFile('.pair-session.json', 'utf8')
+      readFile('.gitignore', 'utf8')
     ])
     for (const text of [start, confirm, confirmAdmin]) expect(text).toContain('LEGACY_PAIR_SCRIPT_DISABLED')
-    expect(session.trim()).toBe('{}')
+    expect(gitignore.split(/\r?\n/)).toContain('.pair-session.json')
   })
 
   it('requires exact Telegram pairing codes and throttles password login', async () => {
