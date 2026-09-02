@@ -40,6 +40,7 @@ run(venvPython, [
   '--specpath', join(workDir, 'spec'),
   '--hidden-import', 'telethon',
   '--hidden-import', 'telethon.crypto',
+  '--hidden-import', 'cryptg',
   bridgeScript
 ], 'telegram bridge build')
 

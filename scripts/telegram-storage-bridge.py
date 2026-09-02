@@ -15,11 +15,12 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 try:
+    import cryptg  # noqa: F401 - Telethon auto-detects this native AES implementation.
     from telethon import TelegramClient, events, utils
     from telethon.errors import SessionPasswordNeededError
     from telethon.sessions import SQLiteSession, StringSession
 except Exception as exc:  # pragma: no cover - exercised by packaged/runtime smoke
-    print(f"BRIDGE_DEPENDENCY_ERROR telethon: {exc}", file=sys.stderr, flush=True)
+    print(f"BRIDGE_DEPENDENCY_ERROR telegram stack: {exc}", file=sys.stderr, flush=True)
     raise
 
 SECRET = os.environ.get("EXCELSYNC_BRIDGE_SECRET", "")
@@ -30,6 +31,7 @@ LEGACY_SESSION = os.environ.get("EXCELSYNC_TELEGRAM_LEGACY_SESSION", "").strip()
 INITIAL_CHAT_ID = os.environ.get("EXCELSYNC_TELEGRAM_CHAT_ID", "").strip()
 INITIAL_CHAT_TITLE = os.environ.get("EXCELSYNC_TELEGRAM_CHAT_TITLE", "ai").strip() or "ai"
 PROXY_URL = os.environ.get("EXCELSYNC_TELEGRAM_PROXY_URL", "").strip()
+UPLOAD_PART_SIZE_KB = 512
 
 if not SECRET or API_ID <= 0 or not API_HASH:
     raise RuntimeError("TELEGRAM_BRIDGE_ENV_INVALID")
@@ -257,6 +259,8 @@ def health_snapshot() -> dict[str, Any]:
             "authorized": cached_authorized,
             "chatId": bound_chat_id,
             "chatTitle": bound_chat_title,
+            "cryptoAccelerated": True,
+            "uploadPartSizeKiB": UPLOAD_PART_SIZE_KB,
             "probeErrorCode": auth_probe_error_code,
             "probeErrorMessage": auth_probe_error_message,
         }
@@ -381,14 +385,21 @@ async def upload(path: str, chat_id: str, expected_sha256: str, operation_id: st
 
     transfer_started_at = time.monotonic()
     update_transfer_progress(operation_id, "upload", local.name, "transferring", 0, size, transfer_started_at)
-    message = await client.send_file(
-        entity,
+    uploaded_file = await client.upload_file(
         str(local),
-        force_document=True,
-        caption=f"ExcelSync sha256={actual_hash[:16]}",
+        part_size_kb=UPLOAD_PART_SIZE_KB,
+        file_size=size,
+        file_name=local.name,
         progress_callback=lambda current, total: update_transfer_progress(
             operation_id, "upload", local.name, "transferring", int(current), int(total or size), transfer_started_at
         ),
+    )
+    message = await client.send_file(
+        entity,
+        uploaded_file,
+        force_document=True,
+        caption=f"ExcelSync sha256={actual_hash[:16]}",
+        mime_type=mimetypes.guess_type(local.name)[0] or "application/octet-stream",
     )
     update_transfer_progress(operation_id, "upload", local.name, "finalizing", size, size, transfer_started_at)
     metadata = document_metadata(message)
