@@ -16,7 +16,7 @@ describe('Telegram private-group upload performance regressions', () => {
   })
 
   it('uploads with Telegram maximum 512 KiB parts before sending the document message', async () => {
-    const bridge = await readFile(new URL('../scripts/telegram-storage-bridge.py', import.meta.url), 'utf8')
+    const bridge = (await readFile(new URL('../scripts/telegram-storage-bridge.py', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
 
     expect(bridge).toContain('UPLOAD_PART_SIZE_KB = 512')
     expect(bridge).toContain('uploaded_file = await client.upload_file(')
