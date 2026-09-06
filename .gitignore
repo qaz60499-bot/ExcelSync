@@ -20,6 +20,10 @@ __pycache__/
 !.env.example
 *.log
 *.sqlite
+wrangler.local.jsonc
+GitHub-Upload-FINAL/
+ExcelSync-Setup-*.exe
+ExcelSync-Portable-*.exe
 *.sqlite-shm
 *.sqlite-wal
 .DS_Store
@@ -32,5 +36,8 @@ nul
 secrets.json
 bootstrap-secret*
 e2e-login*.json
+builder-debug.yml
+latest.yml
+SHA256SUMS.txt
 .pair-session.json
 .wrangler-secret-input

@@ -97,15 +97,17 @@ describe('security boundaries', () => {
     expect(worker).not.toContain('const cutoff = Date.now() - 15 * 60 * 1000')
   })
 
-  it('pins packaged clients to the production Worker and disables workers.dev', async () => {
+  it('ships the packaged client unbound from a personal Worker with a generic public Wrangler template', async () => {
     const [config, main, wrangler] = await Promise.all([
       readFile('src/main/config.ts', 'utf8'),
       readFile('src/main/index.ts', 'utf8'),
       readFile('wrangler.jsonc', 'utf8')
     ])
-    expect(config).toContain('if (packaged) return false')
+    expect(config).toContain("export const DEFAULT_WORKER_URL = ''")
+    expect(config).toContain("parsed.protocol === 'https:'")
     expect(main).toContain('WORKER_URL_NOT_ALLOWED')
-    expect(wrangler).toContain('"workers_dev": false')
+    expect(wrangler).toContain('"workers_dev": true')
+    expect(wrangler).toContain('"database_id": "00000000-0000-0000-0000-000000000000"')
   })
 
   it('uses encrypted StringSession persistence and release hardening', async () => {

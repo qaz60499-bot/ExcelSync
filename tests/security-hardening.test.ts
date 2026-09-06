@@ -21,10 +21,13 @@ describe('security hardening regressions', () => {
       .toContain('excelsyncroot')
   })
 
-  it('pins packaged clients to the production Worker origin', () => {
-    expect(normalizeWorkerUrl(`${DEFAULT_WORKER_URL}/`)).toBe(DEFAULT_WORKER_URL)
-    expect(isAllowedWorkerUrl(DEFAULT_WORKER_URL, true)).toBe(true)
-    expect(isAllowedWorkerUrl('https://attacker.example', true)).toBe(false)
+  it('ships with no bound Worker and lets packaged users choose their own HTTPS Worker', () => {
+    expect(DEFAULT_WORKER_URL).toBe('')
+    expect(normalizeWorkerUrl('https://example.workers.dev/')).toBe('https://example.workers.dev')
+    expect(isAllowedWorkerUrl('', true)).toBe(false)
+    expect(isAllowedWorkerUrl('https://example.workers.dev', true)).toBe(true)
+    expect(isAllowedWorkerUrl('https://sync.example.com/api', true)).toBe(true)
+    expect(isAllowedWorkerUrl('http://example.com', true)).toBe(false)
     expect(isAllowedWorkerUrl('http://127.0.0.1:8787', true)).toBe(false)
     expect(isAllowedWorkerUrl('http://127.0.0.1:8787', false)).toBe(true)
   })
@@ -85,14 +88,15 @@ describe('security hardening regressions', () => {
     expect(html).toContain("frame-src 'none'")
   })
 
-  it('disables workers.dev and keeps signing verification optional for GitHub packaging', async () => {
+  it('uses a generic public Wrangler template and keeps signing verification optional for GitHub packaging', async () => {
     const wrangler = await readFile(new URL('../wrangler.jsonc', import.meta.url), 'utf8')
     const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
       scripts: Record<string, string>
       build: { electronFuses?: Record<string, boolean>; win?: { signExts?: string[] } }
     }
     const verifier = await readFile(new URL('../scripts/verify-windows-signatures.cjs', import.meta.url), 'utf8')
-    expect(wrangler).toContain('"workers_dev": false')
+    expect(wrangler).toContain('"workers_dev": true')
+    expect(wrangler).toContain('"database_id": "00000000-0000-0000-0000-000000000000"')
     expect(pkg.scripts['package:win']).not.toContain('forceCodeSigning=true')
     expect(pkg.scripts['package:win']).not.toContain('--prepackaged')
     expect(pkg.scripts['package:win']).not.toContain('verify-windows-signatures.cjs')

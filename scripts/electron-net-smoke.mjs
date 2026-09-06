@@ -1,6 +1,7 @@
 import { app, net, session } from 'electron'
 
-const target = process.argv[2] || 'https://excel-sync-worker.qaz60499.workers.dev/health'
+const target = process.argv[2] || process.env.EXCELSYNC_HEALTH_URL
+if (!target) throw new Error('EXCELSYNC_HEALTH_URL_REQUIRED')
 
 app.whenReady().then(async () => {
   try {

@@ -3,7 +3,8 @@ const { join, resolve } = require('node:path')
 const { spawnSync } = require('node:child_process')
 
 const root = resolve(__dirname, '..')
-const userProfile = process.env.USERPROFILE || 'C:\\Users\\gyy12'
+const userProfile = process.env.USERPROFILE || process.env.HOME
+if (!userProfile) throw new Error('USER_PROFILE_NOT_FOUND')
 const desktop = join(userProfile, 'Desktop')
 const target = join(root, 'dist', 'win-unpacked', 'ExcelSync.exe')
 const shortcut = join(desktop, 'ExcelSync.lnk')

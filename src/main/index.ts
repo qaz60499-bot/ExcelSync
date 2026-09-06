@@ -14,7 +14,7 @@ import type {
 import { SUPPORTED_DIALOG_EXTENSIONS } from '../shared/file-types'
 import type { StorageBackend } from '../shared/storage-capabilities'
 import { WorkerApi, ApiError } from './api'
-import { APP_NAME, DEFAULT_WORKER_URL, LEGACY_WORKER_URLS, isAllowedWorkerUrl, normalizeWorkerUrl } from './config'
+import { APP_NAME, DEFAULT_WORKER_URL, isAllowedWorkerUrl, normalizeWorkerUrl } from './config'
 import { LocalDb } from './db'
 import { assertSupportedFileSignature, isManagedFile, MAX_SYNC_FILE_BYTES } from './file-utils'
 import { SessionStore } from './session-store'
@@ -1001,6 +1001,20 @@ function registerIpc(): void {
     if (!telegramUserStorage) throw new Error('TELEGRAM_USER_STORAGE_NOT_READY')
     return telegramUserStorage.status()
   })
+  handleIpc('telegramUser:configure', async (apiId: unknown, apiHash: unknown, groupTitle: unknown) => {
+    if (!telegramUserStorage) throw new Error('TELEGRAM_USER_STORAGE_NOT_READY')
+    const [safeApiId, safeApiHash, safeGroupTitle] = z.tuple([
+      z.number().int().positive().max(2_147_483_647),
+      z.string().trim().min(16).max(256),
+      z.string().trim().min(1).max(128)
+    ]).parse([apiId, apiHash, groupTitle])
+    await telegramUserStorage.configure(safeApiId, safeApiHash, safeGroupTitle)
+    return telegramUserStorage.status()
+  })
+  handleIpc('telegramUser:resolveGroup', async (groupTitle: unknown) => {
+    if (!telegramUserStorage) throw new Error('TELEGRAM_USER_STORAGE_NOT_READY')
+    return telegramUserStorage.resolveGroup(z.string().trim().min(1).max(128).parse(groupTitle))
+  })
   handleIpc('telegramUser:beginAuth', async (phone: unknown) => {
     if (!telegramUserStorage) throw new Error('TELEGRAM_USER_STORAGE_NOT_READY')
     return telegramUserStorage.beginAuthorization(z.string().trim().min(6).max(32).parse(phone))
@@ -1391,7 +1405,7 @@ async function initialize(): Promise<void> {
   localDb.requeueAuthBlocked()
   localDb.requeuePermissionBlocked()
   const configuredWorkerUrl = normalizeWorkerUrl(localDb.getSettings().workerUrl)
-  if (!isAllowedWorkerUrl(configuredWorkerUrl, app.isPackaged) || LEGACY_WORKER_URLS.includes(configuredWorkerUrl as (typeof LEGACY_WORKER_URLS)[number])) {
+  if (configuredWorkerUrl && !isAllowedWorkerUrl(configuredWorkerUrl, app.isPackaged)) {
     localDb.setSettings({ workerUrl: DEFAULT_WORKER_URL })
   }
   sessionStore = new SessionStore(app.getPath('userData'))

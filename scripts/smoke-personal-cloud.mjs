@@ -1,9 +1,10 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 
-const ROOT = 'D:/wendangcodex/ExcelSync'
-const DB = 'excel-sync'
-const BASE_URL = 'https://excel-sync-worker.qaz60499.workers.dev'
+const ROOT = process.cwd()
+const DB = process.env.EXCELSYNC_D1_DATABASE || 'excel-sync'
+const BASE_URL = process.env.EXCELSYNC_E2E_BASE_URL?.trim().replace(/\/+$/, '')
+if (!BASE_URL) throw new Error('EXCELSYNC_E2E_BASE_URL_REQUIRED')
 
 function wrangler(args) {
   const executable = `${ROOT}/node_modules/wrangler/bin/wrangler.js`

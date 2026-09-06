@@ -1,8 +1,4 @@
-export const DEFAULT_WORKER_URL = 'https://saaas.guessyy.ccwu.cc'
-export const LEGACY_WORKER_URLS = [
-  'https://excel-sync-worker.qaz60499.workers.dev',
-  'https://joye.cc.cd'
-] as const
+export const DEFAULT_WORKER_URL = ''
 export const APP_NAME = 'ExcelSync'
 
 export function normalizeWorkerUrl(value: string): string {
@@ -12,7 +8,13 @@ export function normalizeWorkerUrl(value: string): string {
 export function isAllowedWorkerUrl(value: string, packaged: boolean): boolean {
   const normalized = normalizeWorkerUrl(value)
   if (!normalized) return false
-  if (normalized === DEFAULT_WORKER_URL) return true
-  if (packaged) return false
-  return /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(normalized) || /^https:\/\//i.test(normalized)
+  let parsed: URL
+  try {
+    parsed = new URL(normalized)
+  } catch {
+    return false
+  }
+  if (parsed.username || parsed.password) return false
+  if (parsed.protocol === 'https:' && parsed.hostname) return true
+  return !packaged && parsed.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(parsed.hostname)
 }

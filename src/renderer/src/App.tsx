@@ -221,18 +221,23 @@ function ActionButton({ actionKey, label, className, busyAction, disabled = fals
 }
 
 function AuthScreen({ auth, onAuthenticated, embedded = false }: { auth: AuthState; onAuthenticated: () => Promise<void>; embedded?: boolean }): ReactElement {
-  const [mode, setMode] = useState<'login' | 'join'>('login')
+  const [mode, setMode] = useState<'login' | 'join' | 'setup'>(auth.setupProvisioned ? 'setup' : 'login')
   const [username, setUsername] = useState('owner')
   const [inviteCode, setInviteCode] = useState('')
+  const [setupCode, setSetupCode] = useState('')
   const [password, setPassword] = useState('')
   const [workerUrl, setWorkerUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const isSetup = Boolean(auth.setupProvisioned)
+  const isSetup = mode === 'setup'
 
   useEffect(() => {
     void window.excelSync.settings().then((settings) => setWorkerUrl(settings.workerUrl))
   }, [])
+
+  useEffect(() => {
+    if (auth.setupProvisioned) setMode('setup')
+  }, [auth.setupProvisioned])
 
   async function submit(event: React.FormEvent): Promise<void> {
     event.preventDefault()
@@ -241,11 +246,12 @@ function AuthScreen({ auth, onAuthenticated, embedded = false }: { auth: AuthSta
     try {
       if (!workerUrl.trim()) throw new Error('请输入 Worker 地址。')
       await window.excelSync.updateSettings({ workerUrl: workerUrl.trim() })
-      if (isSetup) await window.excelSync.bootstrap(username.trim(), password, '')
+      if (isSetup) await window.excelSync.bootstrap(username.trim(), password, setupCode.trim())
       else if (mode === 'join') await window.excelSync.activateInvite(inviteCode.trim(), password)
       else await window.excelSync.login(username.trim(), password)
       setPassword('')
       setInviteCode('')
+      setSetupCode('')
       await onAuthenticated()
     } catch (err) {
       setError(errorMessage(err))
@@ -259,16 +265,17 @@ function AuthScreen({ auth, onAuthenticated, embedded = false }: { auth: AuthSta
       <section className="auth-card">
         <div className="brand-mark">XS</div>
         <p className="eyebrow">WINDOWS 文件工作台</p>
-        <h1>{isSetup ? '初始化企业与 Owner' : mode === 'join' ? '加入组织' : '登录 ExcelSync'}</h1>
-        <p className="muted">{isSetup ? '第一次使用会创建默认 Organization、Owner 和默认 Workspace。' : mode === 'join' ? '输入管理员分发的一次性邀请码，然后设置你自己的密码。' : '登录后，Worker 会返回真实系统角色和 Workspace Membership，客户端不会允许手动切换管理员视图。'}</p>
-        {!isSetup && <div className="auth-mode-tabs"><button type="button" className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError('') }}>登录</button><button type="button" className={mode === 'join' ? 'active' : ''} onClick={() => { setMode('join'); setError('') }}>邀请码加入</button></div>}
+        <h1>{isSetup ? '创建 Owner' : mode === 'join' ? '加入组织' : '登录 ExcelSync'}</h1>
+        <p className="muted">{isSetup ? '连接你自己的 ExcelSync Worker，使用该 Worker 的一次性 Setup Code 创建首个 Owner 和默认 Workspace。' : mode === 'join' ? '输入管理员分发的一次性邀请码，然后设置你自己的密码。' : '填写你的 Worker 地址和账号信息登录。客户端不会内置或绑定任何个人 Cloudflare 账号。'}</p>
+        <div className="auth-mode-tabs"><button type="button" className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError('') }}>登录</button><button type="button" className={mode === 'join' ? 'active' : ''} onClick={() => { setMode('join'); setError('') }}>邀请码加入</button><button type="button" className={mode === 'setup' ? 'active' : ''} onClick={() => { setMode('setup'); setError('') }}>创建 Owner</button></div>
         <form onSubmit={(event) => void submit(event)}>
           <label>Worker 地址<input value={workerUrl} onChange={(event) => setWorkerUrl(event.target.value)} placeholder="https://excel-sync-worker….workers.dev" /></label>
           {(isSetup || mode === 'login') && <label>用户名<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" /></label>}
-          {!isSetup && mode === 'join' && <label>一次性邀请码<input value={inviteCode} onChange={(event) => setInviteCode(event.target.value.toUpperCase())} placeholder="XS-K8P4-29QM" autoComplete="off" /></label>}
+          {mode === 'join' && <label>一次性邀请码<input value={inviteCode} onChange={(event) => setInviteCode(event.target.value.toUpperCase())} placeholder="XS-K8P4-29QM" autoComplete="off" /></label>}
+          {isSetup && <label>Setup Code<input type="password" value={setupCode} onChange={(event) => setSetupCode(event.target.value)} autoComplete="off" placeholder="由你自己的 Worker 初始化流程生成" /></label>}
           <label>密码<input type="password" value={password} minLength={isSetup || mode === 'join' ? 12 : 1} onChange={(event) => setPassword(event.target.value)} autoComplete={isSetup || mode === 'join' ? 'new-password' : 'current-password'} placeholder={isSetup || mode === 'join' ? '至少 12 个字符' : ''} /></label>
           {error && <div className="error-banner">{error}</div>}
-          <button className="primary full" type="submit" disabled={busy || (!isSetup && mode === 'join' && !inviteCode.trim())}>{busy ? '正在处理…' : isSetup ? '创建 Owner 并登录' : mode === 'join' ? '激活账号并加入' : '登录'}</button>
+          <button className="primary full" type="submit" disabled={busy || (mode === 'join' && !inviteCode.trim()) || (isSetup && !setupCode.trim())}>{busy ? '正在处理…' : isSetup ? '创建 Owner 并登录' : mode === 'join' ? '激活账号并加入' : '登录'}</button>
         </form>
       </section>
     </div>
@@ -991,6 +998,9 @@ function SettingsPage({ settings, onChange, onSave, onChooseDirectory, canManage
   const [clientVersion, setClientVersion] = useState<ClientVersionInfo | null>(null)
   const [securityBusy, setSecurityBusy] = useState(false)
   const [telegramUserStatus, setTelegramUserStatus] = useState<TelegramUserStorageStatusView | null>(null)
+  const [telegramApiId, setTelegramApiId] = useState('')
+  const [telegramApiHash, setTelegramApiHash] = useState('')
+  const [telegramGroupTitle, setTelegramGroupTitle] = useState('ai')
   const [telegramPhone, setTelegramPhone] = useState('')
   const [telegramCode, setTelegramCode] = useState('')
   const [telegramPassword, setTelegramPassword] = useState('')
@@ -1149,13 +1159,20 @@ function SettingsPage({ settings, onChange, onSave, onChooseDirectory, canManage
             </div>
           </div>
         </div>
-        {telegramUserStatus?.state === 'UNCONFIGURED' && <p className="hint">Telegram API ID / API Hash 不会进入 Renderer。请先在本机主进程安全配置中提供 ExcelSync 专用 Telegram App 凭据，然后在这里完成账号授权。</p>}
+        {telegramUserStatus?.state === 'UNCONFIGURED' && <div className="form-grid" style={{ marginTop: 12 }}>
+          <label>Telegram API ID<input type="number" min={1} value={telegramApiId} onChange={(event) => setTelegramApiId(event.target.value)} placeholder="从 my.telegram.org 获取" /></label>
+          <label>Telegram API Hash<input type="password" autoComplete="off" value={telegramApiHash} onChange={(event) => setTelegramApiHash(event.target.value)} placeholder="仅加密保存在本机" /></label>
+          <label>私人群组名称<input value={telegramGroupTitle} onChange={(event) => setTelegramGroupTitle(event.target.value)} placeholder="例如：ai" /></label>
+          <div className="admin-form-action"><button className="primary" disabled={telegramBusy || Number(telegramApiId) <= 0 || telegramApiHash.trim().length < 16 || !telegramGroupTitle.trim()} onClick={() => void runTelegramAction(() => window.excelSync.configureTelegramUser(Number(telegramApiId), telegramApiHash, telegramGroupTitle), 'Telegram 本机凭据与目标群组已安全保存，可以继续手机号授权。')}>保存 Telegram 配置</button></div>
+          <small className="wide">API ID / API Hash 由 Telegram 提供；ExcelSync 只把它们加密保存在当前 Windows 用户的安全存储中，不会写入安装包、D1 或普通日志。</small>
+        </div>}
         {telegramUserStatus && telegramUserStatus.state !== 'UNCONFIGURED' && !telegramUserStatus.authorized && <div className="form-grid" style={{ marginTop: 12 }}>
           {(telegramUserStatus.state === 'UNAUTHORIZED' || telegramUserStatus.state === 'ERROR') && <label className="wide">手机号<div className="input-action"><input value={telegramPhone} onChange={(event) => setTelegramPhone(event.target.value)} placeholder="+86..." autoComplete="tel" /><button className="secondary" disabled={telegramBusy || telegramPhone.trim().length < 6} onClick={() => void runTelegramAction(() => window.excelSync.beginTelegramUserAuth(telegramPhone))}>发送 Telegram 验证码</button></div></label>}
           {telegramUserStatus.state === 'AUTH_FAILED' && <div className="wide"><p className="hint">Telegram 已拒绝或撤销本次授权。可以直接重新发送验证码，不需要退出 ExcelSync。</p><button className="secondary" disabled={telegramBusy || !telegramUserStatus.phoneMasked} onClick={() => void runTelegramAction(() => window.excelSync.restartTelegramUserAuth(), '新的 Telegram 验证码已发送。')}>重新验证</button></div>}
           {telegramUserStatus.state === 'WAITING_CODE' && <label className="wide">Telegram 验证码<div className="input-action"><input value={telegramCode} onChange={(event) => setTelegramCode(event.target.value)} inputMode="numeric" autoComplete="one-time-code" /><button className="secondary" disabled={telegramBusy || telegramCode.trim().length < 3} onClick={() => void runTelegramAction(() => window.excelSync.submitTelegramUserCode(telegramCode))}>验证</button><button className="secondary" disabled={telegramBusy} onClick={() => void runTelegramAction(() => window.excelSync.restartTelegramUserAuth(), '新的 Telegram 验证码已发送。')}>重新发送验证码</button></div><small>验证码只在本机输入；如果 Telegram 提示“不是我”后撤销了授权，可直接重新发送。</small></label>}
           {telegramUserStatus.state === 'WAITING_2FA' && <label className="wide">Telegram 2FA 密码<div className="input-action"><input type="password" value={telegramPassword} onChange={(event) => setTelegramPassword(event.target.value)} autoComplete="current-password" /><button className="secondary" disabled={telegramBusy || !telegramPassword} onClick={() => void runTelegramAction(() => window.excelSync.submitTelegramUserPassword(telegramPassword))}>继续</button></div><small>2FA 密码只在本机输入。</small></label>}
         </div>}
+        {telegramUserStatus?.authorized && <div className="form-grid" style={{ marginTop: 12 }}><label className="wide">绑定私人群组<div className="input-action"><input value={telegramGroupTitle} onChange={(event) => setTelegramGroupTitle(event.target.value)} placeholder="输入现有 Telegram 私人群组名称" /><button className="secondary" disabled={telegramBusy || !telegramGroupTitle.trim()} onClick={() => void runTelegramAction(() => window.excelSync.resolveTelegramUserGroup(telegramGroupTitle), 'Telegram 私人群组已绑定。')}>绑定群组</button></div><small>群组必须已经存在，且当前 Telegram 账号必须是该群组成员并拥有发送文件权限。</small></label></div>}
         {telegramUserStatus?.errorMessage && <p className="hint">{telegramUserStatus.errorCode}: {telegramUserStatus.errorMessage}</p>}
         <p className="hint">Telegram Bot：{canManageStorage ? '连接、Bot Token、配对和健康检查仍在“管理中心 → 存储连接”。' : '由组织管理员管理，旧 Bot 文件无需迁移。'}</p>
       </section>

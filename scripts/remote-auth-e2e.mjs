@@ -6,8 +6,9 @@ import { ProxyAgent, fetch } from 'undici'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const wrangler = join(root, 'node_modules', 'wrangler', 'bin', 'wrangler.js')
-const base = 'https://excel-sync-worker.qaz60499.workers.dev'
-const dispatcher = new ProxyAgent('http://127.0.0.1:10808')
+const base = process.env.EXCELSYNC_E2E_BASE_URL?.trim().replace(/\/+$/, '')
+if (!base) throw new Error('EXCELSYNC_E2E_BASE_URL_REQUIRED')
+const dispatcher = process.env.EXCELSYNC_PROXY_URL ? new ProxyAgent(process.env.EXCELSYNC_PROXY_URL) : undefined
 
 function d1(sql) {
   const result = spawnSync('node', [wrangler, 'd1', 'execute', 'excel-sync', '--remote', '--command', sql], {
@@ -74,5 +75,5 @@ try {
   }, null, 2))
 } finally {
   d1("DELETE FROM sessions; DELETE FROM sync_events; DELETE FROM upload_intents; DELETE FROM file_versions; DELETE FROM files; DELETE FROM users; DELETE FROM app_settings WHERE key='setup_nonce_hash';")
-  await dispatcher.close()
+  await dispatcher?.close()
 }

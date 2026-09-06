@@ -700,6 +700,8 @@ export interface ExcelSyncBridge {
   settings(): Promise<SettingsView>
   updateSettings(patch: Partial<SettingsView>): Promise<SettingsView>
   telegramUserStatus(): Promise<TelegramUserStorageStatusView>
+  configureTelegramUser(apiId: number, apiHash: string, groupTitle: string): Promise<TelegramUserStorageStatusView>
+  resolveTelegramUserGroup(groupTitle: string): Promise<TelegramUserStorageStatusView>
   beginTelegramUserAuth(phone: string): Promise<TelegramUserStorageStatusView>
   submitTelegramUserCode(code: string): Promise<TelegramUserStorageStatusView>
   submitTelegramUserPassword(password: string): Promise<TelegramUserStorageStatusView>

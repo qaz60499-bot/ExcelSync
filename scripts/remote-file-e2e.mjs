@@ -8,8 +8,9 @@ import { Blob } from 'node:buffer'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const wrangler = join(root, 'node_modules', 'wrangler', 'bin', 'wrangler.js')
-const base = 'https://excel-sync-worker.qaz60499.workers.dev'
-const dispatcher = new ProxyAgent('http://127.0.0.1:10808')
+const base = process.env.EXCELSYNC_E2E_BASE_URL?.trim().replace(/\/+$/, '')
+if (!base) throw new Error('EXCELSYNC_E2E_BASE_URL_REQUIRED')
+const dispatcher = process.env.EXCELSYNC_PROXY_URL ? new ProxyAgent(process.env.EXCELSYNC_PROXY_URL) : undefined
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 function d1(sql) {

@@ -133,7 +133,8 @@ try {
   if (!base || !username || !password) throw new Error('BLOCKED: E2E staging credentials are incomplete')
   if (confirmation !== 'EXCELSYNC_STAGING_ONLY') throw new Error('BLOCKED: E2E_STAGING_CONFIRMATION must equal EXCELSYNC_STAGING_ONLY')
   const host = new URL(base).hostname.toLowerCase()
-  if (['excel-sync-worker.qaz60499.workers.dev', 'saaas.guessyy.ccwu.cc'].includes(host)) {
+  const forbiddenHosts = (process.env.EXCELSYNC_PRODUCTION_HOSTS ?? '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean)
+  if (forbiddenHosts.includes(host)) {
     throw new Error(`BLOCKED: production host is forbidden: ${host}`)
   }
 

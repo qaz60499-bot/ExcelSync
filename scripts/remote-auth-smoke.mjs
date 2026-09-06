@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises'
 import { ProxyAgent, fetch } from 'undici'
 
-const base = 'https://excel-sync-worker.qaz60499.workers.dev'
-const dispatcher = new ProxyAgent('http://127.0.0.1:10808')
+const base = process.env.EXCELSYNC_E2E_BASE_URL?.trim().replace(/\/+$/, '')
+if (!base) throw new Error('EXCELSYNC_E2E_BASE_URL_REQUIRED')
+const dispatcher = process.env.EXCELSYNC_PROXY_URL ? new ProxyAgent(process.env.EXCELSYNC_PROXY_URL) : undefined
 const credentials = JSON.parse(await readFile(new URL('../e2e-login.json', import.meta.url), 'utf8'))
 
 async function request(path, init = {}) {

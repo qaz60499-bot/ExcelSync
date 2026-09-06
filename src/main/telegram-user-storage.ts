@@ -8,6 +8,7 @@ import type { TelegramUserStorageReceipt, TelegramUserStorageStatusView, Transfe
 export interface TelegramUserStorageConfig {
   apiId: number
   apiHash: string
+  groupTitle?: string | null
   phone: string | null
   chatId: string | null
   chatTitle: string | null
@@ -168,7 +169,7 @@ export class TelegramUserStorageProvider {
         EXCELSYNC_TELEGRAM_SESSION_STRING: config.sessionString ?? '',
         EXCELSYNC_TELEGRAM_LEGACY_SESSION: legacySession,
         EXCELSYNC_TELEGRAM_CHAT_ID: config.chatId ?? '',
-        EXCELSYNC_TELEGRAM_CHAT_TITLE: config.chatTitle ?? 'ai',
+        EXCELSYNC_TELEGRAM_CHAT_TITLE: config.chatTitle ?? config.groupTitle ?? 'ai',
         EXCELSYNC_TELEGRAM_PROXY_URL: config.proxyUrl?.trim() || process.env.EXCELSYNC_TELEGRAM_PROXY_URL?.trim() || ''
       }
     }) as unknown as ChildProcessWithoutNullStreams
@@ -321,12 +322,25 @@ export class TelegramUserStorageProvider {
     }
   }
 
-  async configure(apiId: number, apiHash: string): Promise<void> {
-    if (!Number.isInteger(apiId) || apiId <= 0 || !apiHash.trim()) throw new Error('TELEGRAM_API_CREDENTIALS_INVALID')
+  async configure(apiId: number, apiHash: string, groupTitle = 'ai'): Promise<void> {
+    const normalizedHash = apiHash.trim()
+    const normalizedGroupTitle = groupTitle.trim()
+    if (!Number.isInteger(apiId) || apiId <= 0 || normalizedHash.length < 16 || !normalizedGroupTitle) throw new Error('TELEGRAM_API_CREDENTIALS_INVALID')
     const existing = await this.store.load()
+    const preserveAuthorization = Boolean(existing && existing.apiId === apiId && existing.apiHash === normalizedHash)
     await this.stop()
-    await this.store.save({ apiId, apiHash: apiHash.trim(), phone: existing?.phone ?? null, chatId: existing?.chatId ?? null, chatTitle: existing?.chatTitle ?? null, proxyUrl: existing?.proxyUrl ?? null, sessionString: existing?.sessionString ?? null })
-    this.state = 'UNAUTHORIZED'
+    if (existing && !preserveAuthorization) await this.store.clearAuthorization()
+    await this.store.save({
+      apiId,
+      apiHash: normalizedHash,
+      groupTitle: normalizedGroupTitle,
+      phone: preserveAuthorization ? existing?.phone ?? null : null,
+      chatId: null,
+      chatTitle: null,
+      proxyUrl: existing?.proxyUrl ?? null,
+      sessionString: preserveAuthorization ? existing?.sessionString ?? null : null
+    })
+    this.state = preserveAuthorization && existing?.sessionString ? 'RESOLVING_GROUP' : 'UNAUTHORIZED'
   }
 
   async configureProxy(proxyUrl: string | null): Promise<void> {
@@ -382,12 +396,13 @@ export class TelegramUserStorageProvider {
       this.state = result.state === 'password_required' ? 'WAITING_2FA' : 'RESOLVING_GROUP'
       if (result.state === 'authorized') {
         await this.persistSession()
-        await this.resolveGroup('ai')
+        const config = await this.store.load()
+        await this.resolveGroup(config?.groupTitle ?? 'ai')
       }
       return this.status()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      this.state = message.includes('TELEGRAM_CODE_INVALID') ? 'WAITING_CODE' : 'AUTH_FAILED'
+      this.state = message.includes('TELEGRAM_CODE_INVALID') ? 'WAITING_CODE' : message.includes('TELEGRAM_GROUP_') ? 'ERROR' : 'AUTH_FAILED'
       throw error
     }
   }
@@ -398,22 +413,25 @@ export class TelegramUserStorageProvider {
       await this.call('/auth/password', { password })
       await this.persistSession()
       this.state = 'RESOLVING_GROUP'
-      await this.resolveGroup('ai')
+      const config = await this.store.load()
+      await this.resolveGroup(config?.groupTitle ?? 'ai')
       return this.status()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      this.state = message.includes('TELEGRAM_2FA_INVALID') ? 'WAITING_2FA' : 'AUTH_FAILED'
+      this.state = message.includes('TELEGRAM_2FA_INVALID') ? 'WAITING_2FA' : message.includes('TELEGRAM_GROUP_') ? 'ERROR' : 'AUTH_FAILED'
       throw error
     }
   }
 
   async resolveGroup(title = 'ai'): Promise<TelegramUserStorageStatusView> {
+    const normalizedTitle = title.trim()
+    if (!normalizedTitle) throw new Error('TELEGRAM_GROUP_TITLE_REQUIRED')
     await this.start()
     this.state = 'RESOLVING_GROUP'
-    const resolved = await this.call<{ chatId: string; chatTitle: string }>('/group/resolve', { title })
+    const resolved = await this.call<{ chatId: string; chatTitle: string }>('/group/resolve', { title: normalizedTitle })
     const config = await this.store.load()
     if (!config) throw new Error('TELEGRAM_USER_STORAGE_NOT_CONFIGURED')
-    await this.store.save({ ...config, chatId: resolved.chatId, chatTitle: resolved.chatTitle })
+    await this.store.save({ ...config, groupTitle: normalizedTitle, chatId: resolved.chatId, chatTitle: resolved.chatTitle })
     this.state = 'CONNECTED'
     return this.status()
   }

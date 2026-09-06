@@ -4,13 +4,7 @@
   "main": "worker/src/index.ts",
   "compatibility_date": "2026-08-30",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": false,
-  "routes": [
-    {
-      "pattern": "saaas.guessyy.ccwu.cc",
-      "custom_domain": true
-    }
-  ],
+  "workers_dev": true,
   "vars": {
     "RETENTION_LIMIT": "20",
     "SESSION_TTL_SECONDS": "2592000",
@@ -23,7 +17,7 @@
     {
       "binding": "DB",
       "database_name": "excel-sync",
-      "database_id": "0e0b96a7-c297-4cab-8e6d-9b5ed240eb5d"
+      "database_id": "00000000-0000-0000-0000-000000000000"
     }
   ],
   "observability": {

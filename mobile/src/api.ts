@@ -1,4 +1,4 @@
-const API_BASE_URL = (import.meta.env.VITE_EXCELSYNC_API_URL ?? 'https://saaas.guessyy.ccwu.cc').trim().replace(/\/+$/, '')
+const API_BASE_URL = (import.meta.env.VITE_EXCELSYNC_API_URL ?? '').trim().replace(/\/+$/, '')
 const CLIENT_VERSION = '1.4.1'
 const API_VERSION = '2026-08-31'
 const SESSION_KEY = 'excel-sync-mobile-session'
