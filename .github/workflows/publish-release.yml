@@ -1,0 +1,59 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        default: v1.4.1
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: npm ci
+
+      - name: Package Setup and Portable
+        shell: powershell
+        run: npm run package:win:ci
+
+      - name: Smoke packaged executables
+        shell: powershell
+        run: ./scripts/windows-package-smoke.ps1 -ArtifactsDir ci-dist
+
+      - name: Generate SHA-256 checksums
+        shell: powershell
+        run: |
+          $setup = Get-ChildItem ci-dist/ExcelSync-Setup-*-x64.exe | Select-Object -First 1
+          $portable = Get-ChildItem ci-dist/ExcelSync-Portable-*-x64.exe | Select-Object -First 1
+          if (-not $setup -or -not $portable) { throw 'RELEASE_EXE_NOT_FOUND' }
+          @(
+            "$( (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower() )  $($setup.Name)",
+            "$( (Get-FileHash $portable.FullName -Algorithm SHA256).Hash.ToLower() )  $($portable.Name)"
+          ) | Set-Content -Encoding ascii ci-dist/SHA256SUMS.txt
+          Get-Content ci-dist/SHA256SUMS.txt
+
+      - name: Upload release assets and publish draft
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release upload $env:RELEASE_TAG ci-dist/ExcelSync-Setup-1.4.1-x64.exe ci-dist/ExcelSync-Portable-1.4.1-x64.exe ci-dist/SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --clobber
+          gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false
