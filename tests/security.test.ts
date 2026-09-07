@@ -88,6 +88,15 @@ describe('security boundaries', () => {
     expect(gitignore.split(/\r?\n/)).toContain('.pair-session.json')
   })
 
+  it('throttles non-critical auth activity writes so background polling cannot exhaust D1 writes', async () => {
+    const worker = await readFile('worker/src/index.ts', 'utf8')
+    expect(worker).toContain('AUTH_ACTIVITY_WRITE_INTERVAL_MS = 10 * 60 * 1000')
+    expect(worker).toContain('session_last_seen_at')
+    expect(worker).toContain('Date.now() - lastSeenMs >= AUTH_ACTIVITY_WRITE_INTERVAL_MS')
+    expect(worker).toContain('D1_DAILY_WRITE_LIMIT')
+    expect(worker).toContain('if (!isD1DailyLimitError(error)) throw error')
+  })
+
   it('requires exact Telegram pairing codes and throttles password login', async () => {
     const worker = await readFile('worker/src/index.ts', 'utf8')
     expect(worker).toContain('DUMMY_PASSWORD_HASH')

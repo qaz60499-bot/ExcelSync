@@ -383,6 +383,15 @@ function mimeFor(name: string): string {
   return mimeForFileName(name)
 }
 
+const AUTH_ACTIVITY_WRITE_INTERVAL_MS = 10 * 60 * 1000
+
+function isD1DailyLimitError(error: unknown): 'read' | 'write' | null {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes("exceeded D1's free tier daily row write limit")) return 'write'
+  if (message.includes("exceeded D1's free tier daily row read limit")) return 'read'
+  return null
+}
+
 async function requireAuth(request: Request, env: RuntimeEnv): Promise<RequestAuth> {
   const authorization = request.headers.get('authorization') ?? ''
   if (!authorization.startsWith('Bearer ')) throw new HttpError(401, 'AUTH_REQUIRED')
@@ -391,7 +400,7 @@ async function requireAuth(request: Request, env: RuntimeEnv): Promise<RequestAu
   const tokenHash = await sha256Text(token)
   const timestamp = nowIso()
   const row = await env.DB.prepare(
-    `SELECT s.id AS session_id, s.device_id,
+    `SELECT s.id AS session_id, s.device_id, s.last_seen_at AS session_last_seen_at,
             u.id, u.username, COALESCE(u.display_name, u.username) AS display_name,
             u.organization_id, u.system_role, u.lifecycle_status, u.account_type, u.access_expires_at, u.status
        FROM sessions s
@@ -403,6 +412,7 @@ async function requireAuth(request: Request, env: RuntimeEnv): Promise<RequestAu
     .first<{
       session_id: string
       device_id: string | null
+      session_last_seen_at: string
       id: string
       username: string
       display_name: string
@@ -422,10 +432,20 @@ async function requireAuth(request: Request, env: RuntimeEnv): Promise<RequestAu
     ])
     throw new HttpError(401, 'ACCOUNT_EXPIRED')
   }
-  await env.DB.batch([
-    env.DB.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').bind(timestamp, row.session_id),
-    ...(row.device_id ? [env.DB.prepare("UPDATE devices SET last_seen_at = ?, status = 'ACTIVE' WHERE id = ? AND user_id = ?").bind(timestamp, row.device_id, row.id)] : [])
-  ])
+  const lastSeenMs = Date.parse(row.session_last_seen_at)
+  if (!Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs >= AUTH_ACTIVITY_WRITE_INTERVAL_MS) {
+    try {
+      await env.DB.batch([
+        env.DB.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').bind(timestamp, row.session_id),
+        ...(row.device_id ? [env.DB.prepare("UPDATE devices SET last_seen_at = ?, status = 'ACTIVE' WHERE id = ? AND user_id = ?").bind(timestamp, row.device_id, row.id)] : [])
+      ])
+    } catch (error) {
+      // last_seen_at is telemetry, not an authorization decision. If the free-tier
+      // D1 write budget is exhausted, authenticated read endpoints must remain usable.
+      // Mutating endpoints will still surface the quota error from their required write.
+      if (!isD1DailyLimitError(error)) throw error
+    }
+  }
   return {
     sessionId: row.session_id,
     deviceId: row.device_id,
@@ -2281,6 +2301,12 @@ export async function appFetch(request: Request, env: RuntimeEnv): Promise<Respo
   } catch (error) {
     if (error instanceof HttpError) {
       return json({ error: { code: error.code, message: error.message, detail: error.detail } }, error.status)
+    }
+    const d1Limit = isD1DailyLimitError(error)
+    if (d1Limit) {
+      const code = d1Limit === 'write' ? 'D1_DAILY_WRITE_LIMIT' : 'D1_DAILY_READ_LIMIT'
+      console.error(JSON.stringify({ level: 'error', code, path: new URL(request.url).pathname }))
+      return json({ error: { code, message: code } }, 503)
     }
     const message = error instanceof Error ? error.message : 'INTERNAL_ERROR'
     const safeMessage = message.startsWith('TELEGRAM_') ? message : 'INTERNAL_ERROR'

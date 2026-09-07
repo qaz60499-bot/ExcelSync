@@ -43,6 +43,13 @@ export class ExcelWatcher {
     this.watcher.on('error', (error) => this.callbacks.onWatcherError?.(error instanceof Error ? error : new Error(String(error))))
   }
 
+  async flushPending(): Promise<void> {
+    const paths = [...this.timers.keys()]
+    for (const timer of this.timers.values()) clearTimeout(timer)
+    this.timers.clear()
+    for (const path of paths) await this.callbacks.onFileReady(path)
+  }
+
   async stop(): Promise<void> {
     for (const timer of this.timers.values()) clearTimeout(timer)
     this.timers.clear()

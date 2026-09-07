@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ApiError, type PreflightResult, type WorkerApi } from '../src/main/api'
-import { LocalDb } from '../src/main/db'
+import { LocalDb, type PendingRow } from '../src/main/db'
 import { sha256File } from '../src/main/file-utils'
 import { SyncEngine } from '../src/main/sync-engine'
 
@@ -85,6 +85,8 @@ class FakeApi {
   }
 
   async renameFile(): Promise<void> {}
+  async releaseFileLease(): Promise<void> {}
+  async clearFilePresence(): Promise<void> {}
   async deleteFile(): Promise<void> { this.deleteCalls += 1 }
   async trashFile(): Promise<void> { this.trashCalls += 1 }
 
@@ -294,6 +296,50 @@ describe('sync engine failure and consistency behavior', () => {
     const pending = db.listPending().find((row) => row.fileId === file.id)
     expect(pending?.status).toBe('PENDING')
     expect(db.getPending(pending!.id)?.base_version).toBe(10)
+    await engine.stop(); db.close()
+  })
+
+  it('re-checks the workbook when the Office lock disappears so the final save is queued', async () => {
+    const { root, path, db, engine } = await fixture('office-lock-release')
+    const { file } = await markCurrentSynced(path, db, 1)
+    await writeFile(path, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('final-after-close')]))
+    const expectedHash = await sha256File(path)
+    const lockPath = join(root, '~$book.xlsx')
+    await (engine as unknown as { handleOfficeLock(path: string, active: boolean): Promise<void> }).handleOfficeLock(lockPath, false)
+    const pending = db.listPending().find((row) => row.fileId === file.id)
+    expect(pending?.status).toBe('PENDING')
+    expect(db.getPending(pending!.id)?.hash).toBe(expectedHash)
+    await engine.stop(); db.close()
+  })
+
+  it('flushes watcher debounce before exit so an immediate app quit does not lose the last edit', async () => {
+    const { path, db, api, engine } = await fixture('shutdown-debounce')
+    const { file } = await markCurrentSynced(path, db, 1)
+    await writeFile(path, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('save-then-exit')]))
+    ;(engine as unknown as { watcher: { schedule(path: string): void } }).watcher.schedule(path)
+    engine.setPaused(false)
+    await engine.flushBeforeExit(2_000)
+    expect(db.getFile(file.id)?.status).toBe('SYNCED')
+    expect(db.listPending()).toHaveLength(0)
+    expect(api.uploadCalls).toBe(1)
+    expect(api.commitCalls).toBe(1)
+    await engine.stop(); db.close()
+  })
+
+  it('parks D1 daily-quota failures until the next UTC reset instead of repeatedly retrying', async () => {
+    const { path, db, engine } = await fixture('d1-quota-wait')
+    const { pending } = await queueCurrent(path, db)
+    await (engine as unknown as { handleProcessingError(pending: PendingRow, error: unknown): Promise<void> }).handleProcessingError(
+      pending,
+      new ApiError('D1_DAILY_WRITE_LIMIT', 503, true, 'D1_DAILY_WRITE_LIMIT')
+    )
+    const retry = db.getPending(pending.id)
+    expect(retry?.status).toBe('RETRY_WAIT')
+    const retryAt = new Date(retry?.next_retry_at ?? '')
+    expect(retryAt.getUTCHours()).toBe(0)
+    expect(retryAt.getUTCMinutes()).toBe(0)
+    expect(retryAt.getUTCSeconds()).toBe(30)
+    expect(retryAt.getTime()).toBeGreaterThan(Date.now())
     await engine.stop(); db.close()
   })
 

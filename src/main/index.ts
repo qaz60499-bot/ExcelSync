@@ -1367,9 +1367,10 @@ async function requestGracefulQuit(): Promise<void> {
   try {
     if (localDb && sessionStore && syncEngine) {
       const settings = localDb.getSettings()
-      const counts = localDb.counts()
       const storedSession = await sessionStore.load()
-      if (storedSession && settings.autoSync && counts.pending > 0) {
+      if (storedSession && settings.autoSync) {
+        // flushBeforeExit first drains any watcher debounce that has not reached
+        // pending_sync yet, so save-and-immediately-exit cannot lose the last edit.
         tray?.setToolTip(`${APP_NAME} — 正在完成退出前同步…`)
         await syncEngine.flushBeforeExit()
       }

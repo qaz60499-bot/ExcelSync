@@ -14,6 +14,11 @@ export interface SyncEngineCallbacks {
   canSyncCloud?(): Promise<boolean>
 }
 
+function nextUtcDailyResetIso(): string {
+  const now = new Date()
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 30)).toISOString()
+}
+
 function conflictName(path: string): string {
   const extension = extname(path)
   const stem = basename(path, extension)
@@ -72,7 +77,10 @@ export class SyncEngine {
       this.timer = setInterval(() => void this.processOne(), 2000)
     }
     if (!this.remoteTimer) {
-      this.remoteTimer = setInterval(() => void this.pullRemoteChanges(), 15_000)
+      // Remote reconciliation does not need sub-minute polling. Local filesystem
+      // changes are queued immediately by the watcher; a slower cloud poll avoids
+      // burning D1 reads/auth activity while the desktop is idle.
+      this.remoteTimer = setInterval(() => void this.pullRemoteChanges(), 60_000)
     }
     if (!this.presenceTimer) {
       this.presenceTimer = setInterval(() => void this.refreshPresence(), 25_000)
@@ -155,18 +163,25 @@ export class SyncEngine {
     const relativePath = this.relativePath(targetPath)
     if (!relativePath) return
     const file = this.db.getFileByPath(relativePath)
-    if (!file || file.current_version <= 0) return
     if (!active) {
-      this.presenceFiles.delete(file.id)
-      const leaseId = this.fileLeases.get(file.id)
-      this.fileLeases.delete(file.id)
-      if (this.cloudAccessEnabled) {
-        if (leaseId) await this.api.releaseFileLease(file.id, leaseId).catch(() => undefined)
-        await this.api.clearFilePresence(file.id).catch(() => undefined)
+      if (file?.current_version && file.current_version > 0) {
+        this.presenceFiles.delete(file.id)
+        const leaseId = this.fileLeases.get(file.id)
+        this.fileLeases.delete(file.id)
+        if (this.cloudAccessEnabled) {
+          if (leaseId) await this.api.releaseFileLease(file.id, leaseId).catch(() => undefined)
+          await this.api.clearFilePresence(file.id).catch(() => undefined)
+        }
       }
+      // Excel commonly emits its final file write while the workbook is still locked.
+      // The ordinary change event can therefore be rejected as busy/not-stable. When
+      // the ~$ lock disappears, re-read the real workbook so the final saved bytes are
+      // persisted to the queue even if there is no later filesystem change event.
+      await this.handleFileReady(targetPath)
       this.callbacks.onStateChanged?.()
       return
     }
+    if (!file || file.current_version <= 0) return
     if (this.cloudAccessEnabled) {
       try {
         const lease = await this.api.acquireFileLease(file.id, this.fileLeases.get(file.id))
@@ -426,7 +441,9 @@ export class SyncEngine {
   }
 
   async flushBeforeExit(maxWaitMs = 180_000): Promise<void> {
-    if (this.paused || this.stopped || !this.cloudAccessEnabled) return
+    if (this.stopped) return
+    await this.watcher.flushPending()
+    if (this.paused || !this.cloudAccessEnabled) return
     if (this.callbacks.canSyncCloud && !(await this.callbacks.canSyncCloud())) return
 
     this.shutdownDraining = true
@@ -512,6 +529,7 @@ export class SyncEngine {
     if (this.paused || this.stopped || !this.cloudAccessEnabled || this.pullingRemote || !this.root) return
     if (this.callbacks.canSyncCloud && !(await this.callbacks.canSyncCloud())) return
     this.pullingRemote = true
+    let stateChanged = false
     try {
       try {
         await this.syncTelegramUserGroup()
@@ -519,7 +537,8 @@ export class SyncEngine {
         this.db.log('TELEGRAM_USER_CATCHUP_ERROR', null, error instanceof Error ? error.message : String(error))
       }
       try {
-        await this.api.pullTelegramImports()
+        const importResult = await this.api.pullTelegramImports()
+        if (importResult.importedCount > 0) stateChanged = true
       } catch (error) {
         if (!(error instanceof ApiError) || !['AUTH_REQUIRED', 'INVALID_SESSION', 'TELEGRAM_CHAT_NOT_CONNECTED'].includes(error.code)) {
           throw error
@@ -557,6 +576,7 @@ export class SyncEngine {
               storageBackend: cloud.current_storage_backend,
               storageLocator: cloud.current_storage_locator
             })
+            stateChanged = true
           }
           continue
         }
@@ -573,6 +593,7 @@ export class SyncEngine {
             storageBackend: cloud.current_storage_backend,
             storageLocator: cloud.current_storage_locator
           })
+          stateChanged = true
         }
         if (local) {
           let state = this.db.getState(local.id)
@@ -584,6 +605,7 @@ export class SyncEngine {
                 local = this.db.markMissing(relativePath) ?? local
                 state = this.db.getState(local.id)
                 this.db.log('LOCAL_COPY_MISSING_RECONCILED', local.id, relativePath)
+                stateChanged = true
               } else {
                 throw error
               }
@@ -627,12 +649,12 @@ export class SyncEngine {
           storageBackend: remote.backend,
           storageLocator: remote.locator ?? cloud.current_storage_locator
         })
+        stateChanged = true
       }
-      this.callbacks.onStateChanged?.()
+      if (stateChanged) this.callbacks.onStateChanged?.()
     } catch (error) {
       if (error instanceof ApiError && (error.code === 'AUTH_REQUIRED' || error.code === 'INVALID_SESSION')) return
       this.db.log('REMOTE_PULL_ERROR', null, error instanceof Error ? error.message : String(error))
-      this.callbacks.onStateChanged?.()
     } finally {
       this.pullingRemote = false
     }
@@ -879,6 +901,10 @@ export class SyncEngine {
 
   private async handleProcessingError(pending: PendingRow, error: unknown): Promise<void> {
     if (error instanceof ApiError) {
+      if (error.code === 'D1_DAILY_WRITE_LIMIT' || error.code === 'D1_DAILY_READ_LIMIT') {
+        this.db.markRetry(pending.id, error.code, error.message, nextUtcDailyResetIso())
+        return
+      }
       if (error.code === 'AUTH_REQUIRED' || error.code === 'INVALID_SESSION') {
         this.db.markRetry(pending.id, error.code, error.message, new Date(Date.now() + 60 * 60 * 1000).toISOString())
         return

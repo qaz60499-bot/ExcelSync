@@ -167,6 +167,8 @@ function errorMessage(error: unknown): string {
     AUTH_REQUIRED: '登录状态已失效，请重新登录。',
     INVALID_SESSION: '登录状态已失效，请重新登录。',
     INVALID_CREDENTIALS: '用户名或密码不正确。',
+    D1_DAILY_WRITE_LIMIT: 'Cloudflare D1 今日免费写入额度已用完；队列会保留，并在 UTC 00:00 额度重置后自动继续同步。',
+    D1_DAILY_READ_LIMIT: 'Cloudflare D1 今日免费读取额度已用完；额度会在 UTC 00:00 重置。',
     WORKER_URL_MUST_USE_HTTPS: 'Worker 地址必须使用 HTTPS。',
     SYNC_DIRECTORY_NOT_CONFIGURED: '请先在“设置”中选择同步文件夹。',
     FILE_NOT_FOUND: '找不到该文件。',
@@ -416,7 +418,7 @@ function PreviewDrawer({ file, preview, presence, activity, loading, canEdit, ca
       setComments(nextComments)
     }
     void refresh()
-    const timer = window.setInterval(() => void refresh(), 15_000)
+    const timer = window.setInterval(() => void refresh(), 30_000)
     return () => { active = false; window.clearInterval(timer) }
   }, [file?.id])
   if (!file) return null
@@ -1427,7 +1429,7 @@ export default function App(): ReactElement {
     })
     const timer = window.setInterval(() => {
       if (auth.authenticated) void refreshAll().catch(() => undefined)
-    }, 15_000)
+    }, 60_000)
     return () => {
       unsubscribe()
       unsubscribeTransfer()
@@ -1441,7 +1443,7 @@ export default function App(): ReactElement {
   useEffect(() => {
     if (!auth.authenticated) { setNotificationData(null); return }
     void refreshNotifications(notificationFilter)
-    const timer = window.setInterval(() => void refreshNotifications(notificationFilter), 30_000)
+    const timer = window.setInterval(() => void refreshNotifications(notificationFilter), 60_000)
     return () => window.clearInterval(timer)
   }, [auth.authenticated, notificationFilter])
 
