@@ -97,6 +97,20 @@ describe('security boundaries', () => {
     expect(worker).toContain('if (!isD1DailyLimitError(error)) throw error')
   })
 
+  it('keeps sync-state churn local and caches health probes to avoid D1 read amplification', async () => {
+    const [renderer, main] = await Promise.all([
+      readFile('src/renderer/src/App.tsx', 'utf8'),
+      readFile('src/main/index.ts', 'utf8')
+    ])
+    expect(renderer).toContain('void refreshLocalState().catch(() => undefined)')
+    expect(renderer).not.toContain("onStateChanged(() => {\n      void refreshAll()")
+    expect(main).toContain('HEALTH_CACHE_TTL_MS = 60_000')
+    expect(main).toContain('if (healthCache && healthCache.expiresAt > now) return healthCache.value')
+    expect(main).toContain('if (healthProbe) return healthProbe')
+    expect(main).toContain('healthCacheGeneration += 1')
+    expect(main).toContain('healthCache = null')
+  })
+
   it('requires exact Telegram pairing codes and throttles password login', async () => {
     const worker = await readFile('worker/src/index.ts', 'utf8')
     expect(worker).toContain('DUMMY_PASSWORD_HASH')

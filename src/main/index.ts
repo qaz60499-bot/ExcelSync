@@ -49,6 +49,11 @@ let desktopStorageRouter: DesktopStorageRouter | null = null
 let quitting = false
 let shutdownInProgress = false
 let finalQuitReady = false
+const HEALTH_CACHE_TTL_MS = 60_000
+const HEALTH_FAILURE_CACHE_TTL_MS = 15_000
+let healthCache: { value: HealthView; expiresAt: number } | null = null
+let healthProbe: Promise<HealthView> | null = null
+let healthCacheGeneration = 0
 
 function requireServices(): {
   db: LocalDb
@@ -70,6 +75,11 @@ function sendTransferProgress(progress: TransferProgressView): void {
 }
 
 function sendAuthChanged(): void {
+  // Auth controls the authenticated storage-status probe used by getHealth().
+  // Never carry that cached view across login/logout/device-session changes.
+  healthCacheGeneration += 1
+  healthCache = null
+  healthProbe = null
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('auth:changed')
 }
 
@@ -101,34 +111,53 @@ function handleIpc<TArgs extends unknown[], TResult>(
 }
 
 async function getHealth(): Promise<HealthView> {
+  const now = Date.now()
+  if (healthCache && healthCache.expiresAt > now) return healthCache.value
+  if (healthProbe) return healthProbe
+
+  const generation = healthCacheGeneration
   const { api } = requireServices()
-  try {
-    const health = await api.health()
-    let reachable = false
-    let detail: string | undefined
+  const probe = (async (): Promise<HealthView> => {
     try {
-      const storage = await api.storageStatus()
-      reachable = storage.reachable
-      detail = storage.message
-    } catch {
-      // Public health intentionally avoids outbound Telegram probes; authenticated storage status is optional here.
-    }
-    return {
-      online: true,
-      worker: health.ok ? 'ok' : 'error',
-      telegram: {
-        tokenConfigured: health.telegram.tokenConfigured,
-        chatConfigured: health.telegram.chatConfigured,
-        reachable,
-        detail
+      const health = await api.health()
+      let reachable = false
+      let detail: string | undefined
+      try {
+        const storage = await api.storageStatus()
+        reachable = storage.reachable
+        detail = storage.message
+      } catch {
+        // Public health intentionally avoids outbound Telegram probes; authenticated storage status is optional here.
       }
+      const value: HealthView = {
+        online: true,
+        worker: health.ok ? 'ok' : 'error',
+        telegram: {
+          tokenConfigured: health.telegram.tokenConfigured,
+          chatConfigured: health.telegram.chatConfigured,
+          reachable,
+          detail
+        }
+      }
+      if (generation === healthCacheGeneration) healthCache = { value, expiresAt: now + HEALTH_CACHE_TTL_MS }
+      return value
+    } catch (error) {
+      const value: HealthView = {
+        online: false,
+        worker: error instanceof ApiError && !error.retryable ? 'error' : 'offline',
+        telegram: { tokenConfigured: false, chatConfigured: false, reachable: false }
+      }
+      // Short failure caching prevents a network outage from turning UI state
+      // churn into a retry storm while still recovering quickly when connectivity returns.
+      if (generation === healthCacheGeneration) healthCache = { value, expiresAt: now + HEALTH_FAILURE_CACHE_TTL_MS }
+      return value
     }
-  } catch (error) {
-    return {
-      online: false,
-      worker: error instanceof ApiError && !error.retryable ? 'error' : 'offline',
-      telegram: { tokenConfigured: false, chatConfigured: false, reachable: false }
-    }
+  })()
+  healthProbe = probe
+  try {
+    return await probe
+  } finally {
+    if (healthProbe === probe) healthProbe = null
   }
 }
 

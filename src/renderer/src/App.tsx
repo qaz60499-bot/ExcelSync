@@ -1377,36 +1377,45 @@ export default function App(): ReactElement {
     }
   }
 
-  async function refreshAll(includeTrash = auth.authenticated, authSnapshot: AuthState = auth): Promise<void> {
-    const [dash, fileRows, taskRows, problemRows, activityRows, settingRows, trashRows, userTaskRows] = await Promise.all([
+  async function refreshLocalState(): Promise<void> {
+    const [dash, fileRows, taskRows, problemRows, settingRows] = await Promise.all([
       window.excelSync.dashboard(),
       window.excelSync.files(),
       window.excelSync.pending(),
       window.excelSync.problems(),
+      window.excelSync.settings()
+    ])
+    setDashboardData(dash)
+    setFiles(fileRows)
+    setTasks(taskRows)
+    setProblems(problemRows)
+    setSettings(settingRows)
+    if (!uploadStorageTouchedRef.current) setUploadStorageBackend(settingRows.defaultStorageBackend)
+    setPaused(!settingRows.autoSync)
+  }
+
+  async function refreshAll(includeTrash = auth.authenticated, authSnapshot: AuthState = auth): Promise<void> {
+    const [, activityRows, trashRows, userTaskRows] = await Promise.all([
+      refreshLocalState(),
       window.excelSync.activity(),
-      window.excelSync.settings(),
       includeTrash ? window.excelSync.trash() : Promise.resolve([] as TrashFileView[]),
       authSnapshot.authenticated ? window.excelSync.tasks(
         (authSnapshot.user?.systemRole === 'OWNER' || authSnapshot.user?.systemRole === 'ADMIN' || (authSnapshot.memberships ?? []).find((item) => item.workspaceId === authSnapshot.defaultWorkspaceId)?.role === 'MANAGER') ? 'all' : 'mine',
         authSnapshot.defaultWorkspaceId ?? undefined
       ) : Promise.resolve([] as UserTaskView[])
     ])
-    setDashboardData(dash)
-    setFiles(fileRows)
     setTrashFiles(trashRows)
-    setTasks(taskRows)
-    setProblems(problemRows)
     setUserTasks(userTaskRows.map(cloudTaskToUserTask))
     setActivity(activityRows)
-    setSettings(settingRows)
-    if (!uploadStorageTouchedRef.current) setUploadStorageBackend(settingRows.defaultStorageBackend)
-    setPaused(!settingRows.autoSync)
   }
 
   useEffect(() => {
     void refreshAuth().catch((error) => setToast(errorMessage(error)))
     const unsubscribe = window.excelSync.onStateChanged(() => {
-      void refreshAll().catch(() => undefined)
+      // Sync-engine state changes can happen several times per file (queued,
+      // uploading, committed). Refresh only local state here so those events do
+      // not fan out into repeated cloud activity/trash/task queries.
+      void refreshLocalState().catch(() => undefined)
     })
     const unsubscribeTransfer = window.excelSync.onTransferProgress((progress) => {
       const existingTimer = transferCleanupTimersRef.current.get(progress.id)
