@@ -17,6 +17,8 @@ D1 contains structured business state only: users, sessions, files, version meta
 ### TelegramStorage
 `TelegramStorage` implements `StorageProvider`. Worker business logic depends on the provider interface rather than Telegram API calls. A future `R2Storage` can implement the same interface without replacing the local sync engine or version model.
 
+The Bot route uploads bytes through the Worker. The MTProto User Group route uploads directly from Electron Main through the existing Python bridge; only authorization, receipts and metadata cross the Worker. A private immutable upload snapshot is hashed and then transferred, so Excel saving the original path cannot change the bytes described by the receipt. Historical downloads resolve the locator's chat only within the authorized Telegram account's dialogs and do not rebind the active group.
+
 ## Local SQLite
 
 The client persists:
@@ -87,7 +89,7 @@ The D1 current pointer cannot advance before Telegram has returned a durable `fi
 
 The local UPSERT key is derived from file id, base version and content hash. Worker upload intents are unique per owner and idempotency key.
 
-This specifically protects the failure window:
+An already-persisted uploaded intent protects the commit-response failure window:
 
 ```text
 Telegram upload succeeded
@@ -97,6 +99,20 @@ Telegram upload succeeded
  -> commit_required
  -> no second Telegram upload
 ```
+
+For Bot sends, `upload_intents.upload_receipt` first stores a claim acquired with a conditional update while status remains `reserved`. Only the acknowledged claim owner sends the document. After Telegram success the Worker creates an authenticated receipt bound to the owner, organization, intent, original base/hash/size, origin, storage connection, Bot identity and chat. The response returns it even if D1 cannot save the uploaded metadata. Main saves this capability to SQLite before calling the receipt-recovery endpoint and committing; it never exposes it to Renderer.
+
+Saved receipts are recovered before reading the current local path. A new local save is queued behind the original receipt and rebased after commit. Local removal cannot erase an in-flight job or a stored receipt. Concurrent/replayed commits acknowledge the original committed version rather than creating another version or reporting a false content conflict.
+
+If the external send outcome is unknown and no receipt survives, the durable claim prevents automatic retransmission. There is no claim timeout takeover. Bot API `sendDocument` has no application idempotency key, so this boundary requires storage reconciliation; it cannot guarantee exactly-once delivery after losing every receipt copy. Key/origin changes must retain access to pending receipts, and route changes reject recovery rather than committing an unreadable reference.
+
+## Remote reconciliation and shutdown
+
+Remote pulls use single-flight execution and adaptive idle/failure spacing up to five minutes. Manual sync bypasses the schedule. Downloads are staged and hash-verified, with fresh local checks before installation; divergent saves are retained instead of overwritten. Baseline adoption requires current disk bytes and no pending work, not a cached hash alone.
+
+Every graceful quit drains watcher debounce even while paused or signed out. Pending jobs/receipts remain durable. Outstanding HTTP bodies have deadlines and are cancellable during shutdown; SQLite closes after sync handlers stop. Window close still hides to tray; it is distinct from application quit.
+
+Worker JSON input is bounded to 1 MiB and Bot multipart input to the reliable file ceiling plus bounded framing overhead. Version-history responses generate at most the same 500-version window as their SQL query, including legacy gaps. Password hashing and authorization strength are unchanged.
 
 ## Conflict model
 

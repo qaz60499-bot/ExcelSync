@@ -49,13 +49,16 @@ export interface PendingView {
   errorMessage: string | null
   createdAt: string
   updatedAt: string
+  storageBackend?: StorageBackend
+  syncStage?: 'waiting' | 'checking' | 'uploading' | 'commit_pending'
+  hasUploadReceipt?: boolean
 }
 
 export interface TransferProgressView {
   id: string
   direction: 'upload' | 'download'
   fileName: string
-  phase: 'verifying' | 'transferring' | 'finalizing' | 'done'
+  phase: 'verifying' | 'transferring' | 'finalizing' | 'done' | 'failed'
   transferredBytes: number
   totalBytes: number
   bytesPerSecond: number
@@ -171,6 +174,20 @@ export interface TelegramUserStorageReceipt {
   mimeType: string
   createdAt: string
 }
+
+// An authenticated capability from the Worker, not Telegram credentials. Kept
+// in SQLite until the exact upload intent is committed, including across edits.
+export interface TelegramBotStorageReceipt {
+  backend: 'telegram_bot'
+  intentId: string
+  recoveryToken: string
+  sha256: string
+  size: number
+  fileName: string
+  createdAt: string
+}
+
+export type UploadReceipt = TelegramUserStorageReceipt | TelegramBotStorageReceipt
 
 export interface HealthView {
   online: boolean
@@ -685,9 +702,11 @@ export interface ExcelSyncBridge {
   previewFile(fileId: string, sheetName?: string): Promise<PreviewView>
   downloadFile(fileId: string): Promise<string | null>
   downloadFiles(fileIds: string[]): Promise<string[] | null>
+  listSyncFolders(): Promise<string[]>
+  showFileInFolder(fileId: string): Promise<void>
   renameFile(fileId: string, newName: string): Promise<void>
   moveFile(fileId: string, newRelativePath: string): Promise<void>
-  copyFile(fileId: string): Promise<void>
+  copyFile(fileId: string, targetFolder?: string): Promise<void>
   createFolder(relativeParent: string, folderName: string): Promise<void>
   retryTask(taskId: string): Promise<void>
   cancelTask(taskId: string): Promise<void>

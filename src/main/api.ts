@@ -33,7 +33,8 @@ import type {
   WorkspaceMembershipView,
   WorkspaceRole,
   WorkspaceView,
-  TelegramUserStorageReceipt
+  TelegramBotStorageReceipt,
+  UploadReceipt
 } from '../shared/contracts'
 import { mimeForFileName } from '../shared/file-types'
 import type { SessionStore } from './session-store'
@@ -73,6 +74,66 @@ type Fetcher = (input: string, init?: RequestInit) => Promise<Response>
 
 const MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024
 
+interface RequestLifetime {
+  controller: AbortController
+  timedOut: boolean
+  cleanup: () => void
+}
+
+function networkError(error?: unknown): ApiError {
+  const message = error instanceof Error ? error.message : 'Network error'
+  return new ApiError('NETWORK_ERROR', 0, true, message)
+}
+
+async function readErrorEnvelope(response: Response): Promise<ApiEnvelopeError> {
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  const reader = response.body?.getReader()
+  if (!reader) return {}
+
+  if (!contentType.includes('application/json')) {
+    void reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+    return {}
+  }
+
+  const declaredLength = Number(response.headers.get('content-length') ?? 0)
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_RESPONSE_BYTES) {
+    void reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+    return {}
+  }
+
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > MAX_JSON_RESPONSE_BYTES) {
+        void reader.cancel().catch(() => undefined)
+        return {}
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as ApiEnvelopeError
+  } catch {
+    return {}
+  }
+}
+
 async function readBoundedJson<T>(response: Response): Promise<T> {
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
   if (!contentType.includes('application/json')) {
@@ -94,7 +155,7 @@ async function readBoundedJson<T>(response: Response): Promise<T> {
       if (!value) continue
       total += value.byteLength
       if (total > MAX_JSON_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => undefined)
+        void reader.cancel().catch(() => undefined)
         throw new ApiError('RESPONSE_TOO_LARGE', 502, false)
       }
       chunks.push(value)
@@ -126,6 +187,9 @@ export interface ClientIdentity {
 }
 
 export class WorkerApi {
+  private readonly responseLifetimes = new WeakMap<Response, RequestLifetime>()
+  private readonly activeRequests = new Set<AbortController>()
+
   constructor(
     private readonly sessionStore: SessionStore,
     private readonly getBaseUrl: () => string,
@@ -141,6 +205,10 @@ export class WorkerApi {
 
   private async devicePayload(): Promise<ClientIdentity & { stableDeviceId: string }> {
     return { ...this.getClientIdentity(), stableDeviceId: await this.sessionStore.stableDeviceId() }
+  }
+
+  cancelRequests(): void {
+    for (const controller of this.activeRequests) controller.abort()
   }
 
   private async request(
@@ -164,16 +232,31 @@ export class WorkerApi {
     if (options.setupNonce) headers.set('x-setup-nonce', options.setupNonce)
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 20_000)
+    this.activeRequests.add(controller)
+    const externalSignal = init.signal
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, options.timeoutMs ?? 20_000)
+    const abortFromCaller = () => controller.abort(externalSignal?.reason)
+    if (externalSignal?.aborted) abortFromCaller()
+    else externalSignal?.addEventListener('abort', abortFromCaller, { once: true })
+    const lifetime: RequestLifetime = {
+      controller,
+      get timedOut() { return timedOut },
+      cleanup: () => {
+        this.activeRequests.delete(controller)
+        clearTimeout(timeout)
+        externalSignal?.removeEventListener('abort', abortFromCaller)
+      }
+    }
+    let handedOff = false
     try {
-      const response = await this.fetcher(`${base}${path}`, { ...init, headers, signal: init.signal ?? controller.signal })
+      const response = await this.fetcher(`${base}${path}`, { ...init, headers, signal: controller.signal })
       if (!response.ok) {
-        let payload: ApiEnvelopeError = {}
-        try {
-          payload = (await response.clone().json()) as ApiEnvelopeError
-        } catch {
-          // Keep status-based error if server did not return JSON.
-        }
+        const payload = await readErrorEnvelope(response)
+        if (timedOut) throw networkError()
         const code = payload.error?.code ?? `HTTP_${response.status}`
         if (response.status === 401 && options.auth !== false) {
           await this.sessionStore.clear()
@@ -181,13 +264,30 @@ export class WorkerApi {
         }
         throw new ApiError(code, response.status, retryableStatus(response.status), payload.error?.message ?? code, payload.error?.detail)
       }
+      this.responseLifetimes.set(response, lifetime)
+      handedOff = true
       return response
     } catch (error) {
+      if (timedOut || controller.signal.aborted) throw networkError(error)
       if (error instanceof ApiError) throw error
-      const message = error instanceof Error ? error.message : 'Network error'
-      throw new ApiError('NETWORK_ERROR', 0, true, message)
+      throw networkError(error)
     } finally {
-      clearTimeout(timeout)
+      if (!handedOff) lifetime.cleanup()
+    }
+  }
+
+  private async consumeResponse<T>(response: Response, consume: () => Promise<T>): Promise<T> {
+    const lifetime = this.responseLifetimes.get(response)
+    try {
+      const result = await consume()
+      if (lifetime?.timedOut || lifetime?.controller.signal.aborted) throw networkError()
+      return result
+    } catch (error) {
+      if (lifetime?.timedOut || lifetime?.controller.signal.aborted) throw networkError(error)
+      throw error
+    } finally {
+      lifetime?.cleanup()
+      this.responseLifetimes.delete(response)
     }
   }
 
@@ -197,7 +297,7 @@ export class WorkerApi {
     options: { auth?: boolean; setupNonce?: string; timeoutMs?: number } = { auth: true }
   ): Promise<T> {
     const response = await this.request(path, init, options)
-    return readBoundedJson<T>(response)
+    return this.consumeResponse(response, () => readBoundedJson<T>(response))
   }
 
   async health(): Promise<{
@@ -352,16 +452,23 @@ export class WorkerApi {
     }
   }
 
-  async upload(intentId: string, localPath: string): Promise<void> {
+  async upload(intentId: string, localPath: string): Promise<TelegramBotStorageReceipt | null> {
     const bytes = await readFile(localPath)
     const form = new FormData()
     form.set('intentId', intentId)
     const fileName = localPath.split(/[\\/]/).pop() ?? 'file.bin'
     form.set('file', new File([bytes], fileName, { type: mimeForFileName(fileName) }))
-    await this.json('/sync/upload', { method: 'POST', body: form }, { auth: true, timeoutMs: 180_000 })
+    const result = await this.json<{ receipt?: TelegramBotStorageReceipt }>('/sync/upload', { method: 'POST', body: form }, { auth: true, timeoutMs: 180_000 })
+    if (!result.receipt) return null // Older Workers persist the receipt in D1.
+    if (result.receipt.backend !== 'telegram_bot' || result.receipt.intentId !== intentId ||
+        !result.receipt.recoveryToken || !/^[a-f0-9]{64}$/i.test(result.receipt.sha256) ||
+        result.receipt.size !== bytes.byteLength) {
+      throw new ApiError('INVALID_UPLOAD_RECEIPT', 502, false)
+    }
+    return result.receipt
   }
 
-  async recordUploadReceipt(intentId: string, receipt: TelegramUserStorageReceipt): Promise<void> {
+  async recordUploadReceipt(intentId: string, receipt: UploadReceipt): Promise<void> {
     await this.json('/sync/upload-receipt', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -437,11 +544,11 @@ export class WorkerApi {
 
   async downloadCurrent(fileId: string): Promise<{ bytes: Uint8Array; version: number; hash: string | null }> {
     const response = await this.request(`/files/${encodeURIComponent(fileId)}/download`, { method: 'GET' }, { auth: true, timeoutMs: 180_000 })
-    return {
+    return this.consumeResponse(response, async () => ({
       bytes: new Uint8Array(await response.arrayBuffer()),
       version: Number(response.headers.get('x-excelsync-version') ?? 0),
       hash: response.headers.get('x-excelsync-hash') || null
-    }
+    }))
   }
 
   async downloadVersion(fileId: string, version: number): Promise<{ bytes: Uint8Array; version: number; hash: string | null }> {
@@ -450,11 +557,11 @@ export class WorkerApi {
       { method: 'GET' },
       { auth: true, timeoutMs: 180_000 }
     )
-    return {
+    return this.consumeResponse(response, async () => ({
       bytes: new Uint8Array(await response.arrayBuffer()),
       version: Number(response.headers.get('x-excelsync-version') ?? version),
       hash: response.headers.get('x-excelsync-hash') || null
-    }
+    }))
   }
 
   async versions(fileId: string): Promise<VersionView[]> {

@@ -5,12 +5,15 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { LocalDb } from '../src/main/db'
 
 const roots: string[] = []
+const databases: LocalDb[] = []
 
 async function makeDb(): Promise<{ root: string; path: string; db: LocalDb }> {
   const root = await mkdtemp(join(tmpdir(), 'excelsync-db-'))
   roots.push(root)
   const path = join(root, 'state.sqlite')
-  return { root, path, db: new LocalDb(path) }
+  const db = new LocalDb(path)
+  databases.push(db)
+  return { root, path, db }
 }
 
 function seed(db: LocalDb, hash = 'a'.repeat(64)) {
@@ -25,6 +28,7 @@ function seed(db: LocalDb, hash = 'a'.repeat(64)) {
 }
 
 afterEach(async () => {
+  for (const db of databases.splice(0)) if (db.db.isOpen) db.close()
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
@@ -33,7 +37,6 @@ describe('LocalDb durable queue', () => {
     const { db } = await makeDb()
     expect(db.getSettings().autoSync).toBe(true)
     expect(db.getSettings().retentionLimit).toBe(20)
-    db.close()
   })
 
   it('persists settings across restart', async () => {
@@ -172,6 +175,100 @@ describe('LocalDb durable queue', () => {
     expect(db.getPending(pending.id)?.status).toBe('CONFLICT')
     expect(db.getFile(file.id)?.status).toBe('CONFLICT')
     db.close()
+  })
+
+  it('refuses to cancel a receipt row and retains pending work across cloud trash updates', async () => {
+    const { db } = await makeDb()
+    const file = seed(db)
+    const hash = 'a'.repeat(64)
+    const pending = db.queueUpsert(file, 'D:/ExcelSyncData/book.xlsx', hash, 100)!
+    db.setUploadReceipt(pending.id, {
+      backend: 'telegram_bot', intentId: 'intent-1', recoveryToken: 'recovery-1', sha256: hash,
+      size: 100, fileName: 'book.xlsx', createdAt: new Date().toISOString()
+    })
+    const before = db.getPending(pending.id)
+
+    expect(db.cancelPendingById(pending.id)).toBe(false)
+    expect(db.getPending(pending.id)).toEqual(before)
+    expect(db.getFile(file.id)?.status).toBe('PENDING')
+
+    db.markCloudTrashed(file.id)
+    expect(db.getPending(pending.id)).toEqual(before)
+    expect(db.getFile(file.id)).toMatchObject({ status: 'PENDING', cloud_status: 'trashed' })
+    expect(db.nextReadyPending()).toBeNull()
+
+    db.markCloudDeleted(file.id)
+    expect(db.getPending(pending.id)).toEqual(before)
+    expect(db.getFile(file.id)).toMatchObject({ status: 'PENDING', cloud_status: 'deleted' })
+    expect(db.nextReadyPending()).toBeNull()
+    db.close()
+  })
+
+  it('atomically adopts a matching pristine initial upload as a remote baseline', async () => {
+    const { db } = await makeDb()
+    const file = seed(db)
+    const pending = db.queueUpsert(file, 'D:/ExcelSyncData/book.xlsx', 'a'.repeat(64), 100)!
+
+    const adopted = db.adoptRemoteBaseline(file.id, {
+      id: 'cloud-book-id', relativePath: 'book.xlsx', logicalName: 'book.xlsx', extension: '.xlsx',
+      version: 7, hash: 'a'.repeat(64), size: 100, mtimeMs: Date.now()
+    })
+    expect(adopted).toMatchObject({ id: 'cloud-book-id', current_version: 7, current_hash: 'a'.repeat(64), status: 'SYNCED' })
+    expect(db.getFile(file.id)).toBeNull()
+    expect(db.getPending(pending.id)).toBeNull()
+    expect(db.listPending()).toHaveLength(0)
+    db.close()
+  })
+
+  it('preserves attempted, receipted, in-flight, errored, multiple, and mismatched baseline work', async () => {
+    const cases: Array<{
+      name: string
+      prepare(db: LocalDb, pendingId: string, file: ReturnType<typeof seed>): void
+      hash?: string
+      size?: number
+    }> = [
+      { name: 'attempted', prepare: (db, id) => { db.db.prepare("UPDATE pending_sync SET attempt_count = 1 WHERE id = ?").run(id) } },
+      {
+        name: 'upload receipt',
+        prepare: (db, id) => {
+          db.db.prepare('UPDATE pending_sync SET upload_receipt = ?, retry_state = ? WHERE id = ?')
+            .run('{"backend":"telegram_bot","intentId":"intent"}', '{"stage":"commit_pending","intentId":"intent"}', id)
+        }
+      },
+      { name: 'UPLOADING', prepare: (db, id) => { db.markUploading(id) } },
+      {
+        name: 'RETRY_WAIT',
+        prepare: (db, id) => { db.markRetry(id, 'NETWORK_ERROR', 'offline', new Date(Date.now() + 60_000).toISOString()) }
+      },
+      { name: 'CONFLICT', prepare: (db, id) => { db.markConflict(id, 'remote advanced') } },
+      { name: 'ERROR', prepare: (db, id) => { db.markError(id, 'UPLOAD_FAILED', 'upload failed') } },
+      {
+        name: 'multiple pending rows',
+        prepare: (db, _id, file) => { db.queueUpsert(file, 'D:/ExcelSyncData/book.xlsx', 'b'.repeat(64), 101) }
+      },
+      { name: 'edited hash mismatch', prepare: () => undefined, hash: 'b'.repeat(64) },
+      { name: 'edited size mismatch', prepare: () => undefined, size: 101 }
+    ]
+
+    for (const scenario of cases) {
+      const { db } = await makeDb()
+      const file = seed(db)
+      const pending = db.queueUpsert(file, 'D:/ExcelSyncData/book.xlsx', 'a'.repeat(64), 100)!
+      scenario.prepare(db, pending.id, file)
+      const before = db.getPending(pending.id)
+      const beforeRows = db.listPending().map(({ id, status }) => ({ id, status })).sort((a, b) => a.id.localeCompare(b.id))
+
+      expect(() => db.adoptRemoteBaseline(file.id, {
+        id: 'cloud-book-id', relativePath: 'book.xlsx', logicalName: 'book.xlsx', extension: '.xlsx',
+        version: 7, hash: scenario.hash ?? 'a'.repeat(64), size: scenario.size ?? 100, mtimeMs: Date.now()
+      }), scenario.name).toThrow('LOCAL_BASELINE_HAS_PENDING_WORK')
+      expect(db.getFile(file.id)?.current_version, scenario.name).toBe(0)
+      expect(db.getFile('cloud-book-id'), scenario.name).toBeNull()
+      expect(db.getPending(pending.id), scenario.name).toEqual(before)
+      expect(db.listPending().map(({ id, status }) => ({ id, status })).sort((a, b) => a.id.localeCompare(b.id)), scenario.name)
+        .toEqual(beforeRows)
+      db.close()
+    }
   })
 
   it('requeues authentication-blocked files without losing the local queue', async () => {

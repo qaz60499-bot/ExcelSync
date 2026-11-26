@@ -15,6 +15,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Create report directory
         shell: powershell
         run: New-Item -ItemType Directory -Force test-artifacts/fault-injection | Out-Null
@@ -24,6 +27,12 @@ jobs:
         run: >-
           npx vitest run
           tests/api-fault-injection.test.ts
+          tests/bot-client-recovery.test.ts
+          tests/bot-upload-recovery.test.ts
+          tests/dual-storage.test.ts
+          tests/telegram-user-storage-provider.test.ts
+          tests/http-body-limits.test.ts
+          tests/interrupted-file-recovery.test.ts
           tests/sync-engine.test.ts
           tests/state-machine-abuse.test.ts
           tests/telegram-storage.test.ts
@@ -31,6 +40,10 @@ jobs:
           tests/security-bruteforce-boundary.test.ts
           --reporter=verbose --reporter=json
           --outputFile.json=test-artifacts/fault-injection/vitest.json
+      - id: snapshot
+        name: Immutable Telegram upload snapshot
+        continue-on-error: true
+        run: python tests/telegram_storage_bridge_support_test.py
       - name: Build fault report
         if: always()
         continue-on-error: true
@@ -48,3 +61,4 @@ jobs:
         shell: powershell
         run: |
           if ('${{ steps.faults.outcome }}' -ne 'success') { throw 'Fault injection suite failed' }
+          if ('${{ steps.snapshot.outcome }}' -ne 'success') { throw 'Telegram snapshot suite failed' }

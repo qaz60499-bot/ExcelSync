@@ -9,9 +9,19 @@ $results = [System.Collections.Generic.List[object]]::new()
 $logs = Join-Path $ReportDir 'logs'
 $stateRoot = Join-Path (Resolve-Path '.').Path $ReportDir
 $env:EXCELSYNC_USER_DATA_DIR = Join-Path $stateRoot 'UserData'
-$installDir = Join-Path $env:LOCALAPPDATA 'Programs\ExcelSync-E2E'
+$installDir = Join-Path $env:LOCALAPPDATA ("Programs\ExcelSync-E2E-" + [guid]::NewGuid().ToString('N'))
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'ExcelSync.lnk'
+$startShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\ExcelSync.lnk'
+$shortcutBackups = @{}
 
 New-Item -ItemType Directory -Force -Path $ReportDir, $logs, $env:EXCELSYNC_USER_DATA_DIR | Out-Null
+foreach ($shortcutPath in @($desktopShortcut, $startShortcut)) {
+  if (Test-Path -LiteralPath $shortcutPath) {
+    $backupPath = Join-Path $stateRoot ("shortcut-before-" + [guid]::NewGuid().ToString('N') + '.lnk')
+    Copy-Item -LiteralPath $shortcutPath -Destination $backupPath
+    $shortcutBackups[$shortcutPath] = $backupPath
+  }
+}
 
 function Add-Result([string]$Name, [string]$Status, [string]$Detail = '') {
   $results.Add([pscustomobject]@{ name = $Name; status = $Status; detail = $Detail })
@@ -28,7 +38,7 @@ function Get-ExcelSyncPids {
 
 function Run-App([string]$Exe, [string]$Name) {
   $before = @(Get-ExcelSyncPids)
-  $p = Start-Process -FilePath $Exe -ArgumentList '--e2e-auto-quit-ms=5000' -PassThru
+  $p = Start-Process -FilePath $Exe -ArgumentList '--e2e-auto-quit-ms=5000' -WindowStyle Hidden -PassThru
   if (-not $p.WaitForExit(30000)) {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     Fail-Step $Name "graceful quit timeout; pid=$($p.Id)"
@@ -38,7 +48,7 @@ function Run-App([string]$Exe, [string]$Name) {
   $after = @(Get-ExcelSyncPids)
   $owned = @($after | Where-Object { $_ -notin $before })
   if ($owned.Count -gt 0) {
-    foreach ($pid in $owned) { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }
+    foreach ($ownedProcessId in $owned) { Stop-Process -Id $ownedProcessId -Force -ErrorAction SilentlyContinue }
     Fail-Step "$Name-process-cleanup" "test-owned ExcelSync process remained after graceful quit: $($owned -join ',')"
   }
   Add-Result $Name 'PASS' "started and graceful quit completed; exit=0"
@@ -64,15 +74,13 @@ try {
     }
   }
 
-  if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue }
-  $installer = Start-Process -FilePath $setup.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru -Wait
+  if (Test-Path -LiteralPath $installDir) { Fail-Step 'isolated-install-directory' 'Unique test install directory already exists' }
+  $installer = Start-Process -FilePath $setup.FullName -ArgumentList @('/S', "/D=$installDir") -WindowStyle Hidden -PassThru -Wait
   if ($installer.ExitCode -ne 0) { Fail-Step 'setup-install' "exit=$($installer.ExitCode)" }
   $installedExe = Join-Path $installDir 'ExcelSync.exe'
   if (-not (Test-Path $installedExe)) { Fail-Step 'installed-exe' $installedExe }
   Add-Result 'setup-install' 'PASS' $installedExe
 
-  $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'ExcelSync.lnk'
-  $startShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\ExcelSync.lnk'
   if (Test-Path $desktopShortcut) { Add-Result 'desktop-shortcut' 'PASS' $desktopShortcut } else { Add-Result 'desktop-shortcut' 'FAIL' 'ExcelSync.lnk not found on Desktop' }
   if (Test-Path $startShortcut) { Add-Result 'start-menu-shortcut' 'PASS' $startShortcut } else { Add-Result 'start-menu-shortcut' 'FAIL' 'ExcelSync.lnk not found in Start Menu' }
 
@@ -92,7 +100,7 @@ try {
   $uninstaller = Get-ChildItem $installDir -Filter 'Uninstall*.exe' | Select-Object -First 1
   if (-not $uninstaller) { Fail-Step 'uninstaller-present' 'Uninstaller missing' }
   Add-Result 'uninstaller-present' 'PASS' $uninstaller.FullName
-  $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -PassThru -Wait
+  $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -WindowStyle Hidden -PassThru -Wait
   if ($uninstall.ExitCode -ne 0) { Fail-Step 'uninstall' "exit=$($uninstall.ExitCode)" }
   Start-Sleep -Seconds 2
   Add-Result 'uninstall' 'PASS' 'exit=0'
@@ -106,6 +114,18 @@ try {
 } catch {
   $failure = $_.Exception.Message
 } finally {
+  # Installer smoke checks exercise the real shortcut lifecycle, then restore
+  # pre-existing user shortcuts even if install/start/uninstall failed.
+  foreach ($shortcutPath in @($desktopShortcut, $startShortcut)) {
+    if ($shortcutBackups.ContainsKey($shortcutPath)) {
+      Copy-Item -LiteralPath $shortcutBackups[$shortcutPath] -Destination $shortcutPath -Force
+    } elseif (Test-Path -LiteralPath $shortcutPath) {
+      $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+      if ($link.TargetPath -eq (Join-Path $installDir 'ExcelSync.exe')) {
+        Remove-Item -LiteralPath $shortcutPath -Force
+      }
+    }
+  }
   $ended = Get-Date
   $failedCount = @($results | Where-Object status -eq 'FAIL').Count
   if ($failure -and $failedCount -eq 0) { Add-Result 'uncaught-error' 'FAIL' $failure; $failedCount = 1 }

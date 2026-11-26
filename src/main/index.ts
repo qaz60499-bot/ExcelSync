@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, session, shell, Tray, type MenuItemConstructorOptions } from 'electron'
-import { access, copyFile, lstat, mkdir, readdir, rename as renamePath, rm, stat, writeFile } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { access, copyFile, lstat, mkdir, opendir, readdir, rename as renamePath, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, parse, relative, resolve } from 'node:path'
 import { hostname, release } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -139,7 +140,11 @@ async function getHealth(): Promise<HealthView> {
           detail
         }
       }
-      if (generation === healthCacheGeneration) healthCache = { value, expiresAt: now + HEALTH_CACHE_TTL_MS }
+      if (generation === healthCacheGeneration) {
+        const changed = JSON.stringify(healthCache?.value) !== JSON.stringify(value)
+        healthCache = { value, expiresAt: now + HEALTH_CACHE_TTL_MS }
+        if (changed && !quitting) sendStateChanged()
+      }
       return value
     } catch (error) {
       const value: HealthView = {
@@ -149,7 +154,11 @@ async function getHealth(): Promise<HealthView> {
       }
       // Short failure caching prevents a network outage from turning UI state
       // churn into a retry storm while still recovering quickly when connectivity returns.
-      if (generation === healthCacheGeneration) healthCache = { value, expiresAt: now + HEALTH_FAILURE_CACHE_TTL_MS }
+      if (generation === healthCacheGeneration) {
+        const changed = JSON.stringify(healthCache?.value) !== JSON.stringify(value)
+        healthCache = { value, expiresAt: now + HEALTH_FAILURE_CACHE_TTL_MS }
+        if (changed && !quitting) sendStateChanged()
+      }
       return value
     }
   })()
@@ -164,8 +173,16 @@ async function getHealth(): Promise<HealthView> {
 async function dashboard(): Promise<DashboardView> {
   const { db } = requireServices()
   const counts = db.counts()
+  // Local file/queue refresh must remain immediate when the network is slow.
+  // The coalesced probe publishes a state change only if its health view changes.
+  const health: HealthView = healthCache?.value ?? {
+    online: false,
+    worker: 'offline',
+    telegram: { tokenConfigured: false, chatConfigured: false, reachable: false }
+  }
+  void getHealth().catch(() => undefined)
   return {
-    health: await getHealth(),
+    health,
     syncedFiles: counts.synced,
     pending: counts.pending,
     syncing: counts.syncing,
@@ -204,6 +221,112 @@ async function nextAvailableImportPath(root: string, fileName: string): Promise<
     }
   }
   throw new Error('IMPORT_NAME_EXHAUSTED')
+}
+
+const MAX_SYNC_FOLDER_LIST_COUNT = 5_000
+const MAX_SYNC_FOLDER_LIST_DEPTH = 24
+const MAX_SYNC_FOLDER_SCAN_ENTRIES = 50_000
+
+async function listSyncFolderPaths(root: string): Promise<string[]> {
+  const rootInfo = await lstat(root)
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('SYNC_DIRECTORY_UNAVAILABLE')
+
+  const paths: string[] = []
+  let examinedEntries = 0
+  const queue: Array<{ absolute: string; relative: string; depth: number }> = [{ absolute: resolve(root), relative: '', depth: 0 }]
+  while (queue.length > 0) {
+    const current = queue.shift()!
+    const directory = await opendir(current.absolute)
+    for await (const entry of directory) {
+      examinedEntries += 1
+      if (examinedEntries > MAX_SYNC_FOLDER_SCAN_ENTRIES) throw new Error('FOLDER_LIST_LIMIT_EXCEEDED')
+      if (entry.isSymbolicLink() || !entry.isDirectory()) continue
+      const candidateRelative = current.relative ? `${current.relative}/${entry.name}` : entry.name
+      let safeRelative: string
+      try {
+        safeRelative = safeRelativePath(candidateRelative)
+      } catch {
+        continue
+      }
+      let absolute: string
+      try {
+        absolute = resolveWithinRoot(root, safeRelative)
+      } catch (error) {
+        if (error instanceof Error && error.message === 'PATH_REJECTED') continue
+        throw error
+      }
+      const info = await lstat(absolute)
+      if (info.isSymbolicLink() || !info.isDirectory()) continue
+      if (paths.length >= MAX_SYNC_FOLDER_LIST_COUNT) throw new Error('FOLDER_LIST_LIMIT_EXCEEDED')
+      paths.push(safeRelative)
+      const depth = current.depth + 1
+      if (depth < MAX_SYNC_FOLDER_LIST_DEPTH) queue.push({ absolute, relative: safeRelative, depth })
+    }
+  }
+  return paths.sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right, 'zh-CN'))
+}
+
+async function ensureDirectoryWithinRoot(root: string, relativeDirectory: string): Promise<string> {
+  const safeDirectory = relativeDirectory ? safeRelativePath(relativeDirectory) : ''
+  if (!safeDirectory) return resolve(root)
+  let currentRelative = ''
+  let currentAbsolute = resolve(root)
+  for (const segment of safeDirectory.split('/')) {
+    currentRelative = currentRelative ? `${currentRelative}/${segment}` : segment
+    currentAbsolute = resolveWithinRoot(root, currentRelative)
+    try {
+      await mkdir(currentAbsolute)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+    const info = await lstat(currentAbsolute)
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('PATH_REJECTED')
+  }
+  return currentAbsolute
+}
+
+async function copyToUniquePath(source: string, targetDirectory: string, fileName: string): Promise<string> {
+  const parts = parse(fileName)
+  for (let index = 0; index < 10_000; index += 1) {
+    const candidateName = index === 0 ? fileName : `${parts.name} (${index})${parts.ext}`
+    const candidate = join(targetDirectory, candidateName)
+    try {
+      await copyFile(source, candidate, fsConstants.COPYFILE_EXCL)
+      return candidate
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue
+      throw error
+    }
+  }
+  throw new Error('IMPORT_NAME_EXHAUSTED')
+}
+
+async function downloadToUniquePath(
+  targetDirectory: string,
+  fileName: string,
+  downloadTo: (temporaryPath: string) => Promise<void>
+): Promise<string> {
+  const temporaryPath = join(targetDirectory, `.excel-sync-${randomUUID()}.tmp`)
+  try {
+    await downloadTo(temporaryPath)
+    const temporaryInfo = await lstat(temporaryPath)
+    if (temporaryInfo.isSymbolicLink() || !temporaryInfo.isFile()) throw new Error('DOWNLOAD_NOT_CREATED')
+    const parts = parse(fileName)
+    for (let index = 0; index < 10_000; index += 1) {
+      const candidateName = index === 0 ? fileName : `${parts.name} (${index})${parts.ext}`
+      const candidate = join(targetDirectory, candidateName)
+      try {
+        await copyFile(temporaryPath, candidate, fsConstants.COPYFILE_EXCL)
+        return candidate
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue
+        throw error
+      }
+    }
+    throw new Error('IMPORT_NAME_EXHAUSTED')
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => undefined)
+  }
 }
 
 async function copyValidatedImportFile(source: string, destination: string): Promise<void> {
@@ -845,6 +968,12 @@ function registerIpc(): void {
     z.enum(['telegram_user_group', 'telegram_bot']).optional().parse(storageBackend)
   ))
 
+  handleIpc('files:listFolders', async () => {
+    const root = requireServices().db.getSettings().syncDirectory
+    if (!root) throw new Error('SYNC_DIRECTORY_NOT_CONFIGURED')
+    return listSyncFolderPaths(root)
+  })
+
   handleIpc('files:open', async (fileId: unknown) => {
     const id = z.string().uuid().parse(fileId)
     const local = await ensureLocalFile(id)
@@ -855,6 +984,19 @@ function registerIpc(): void {
     void sync.noteFileOpened(id)
     requireServices().db.log('FILE_OPENED', id, local.logicalName)
     sendStateChanged()
+  })
+
+  handleIpc('files:showInFolder', async (fileId: unknown) => {
+    const id = z.string().uuid().parse(fileId)
+    const { db } = requireServices()
+    const file = db.getFile(id)
+    const root = db.getSettings().syncDirectory
+    if (!file || !root || file.cloud_status !== 'active') throw new Error('FILE_NOT_FOUND')
+    if (db.getState(id)?.exists_flag !== 1) throw new Error('LOCAL_FILE_NOT_AVAILABLE')
+    const absolute = resolveWithinRoot(root, file.relative_path)
+    const info = await lstat(absolute)
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error('LOCAL_FILE_NOT_AVAILABLE')
+    shell.showItemInFolder(absolute)
   })
 
   handleIpc('files:favorite', async (fileId: unknown, favorite: unknown) => {
@@ -909,21 +1051,28 @@ function registerIpc(): void {
     const { db, api } = requireServices()
     const syncRoot = db.getSettings().syncDirectory
     const downloaded: string[] = []
-    for (const id of ids) {
+    for (const id of [...new Set(ids)]) {
       const file = db.getFile(id)
       if (!file || file.cloud_status !== 'active') continue
-      const targetPath = await nextAvailableImportPath(targetRoot, file.logical_name)
+      if (file.current_version <= 0 && db.getState(id)?.exists_flag !== 1) continue
+      const safePath = safeRelativePath(file.relative_path)
+      const parent = dirname(safePath).replaceAll('\\', '/')
+      const targetDirectory = await ensureDirectoryWithinRoot(targetRoot, parent === '.' ? '' : parent)
+      const fileName = basename(safePath)
       const state = db.getState(id)
+      let targetPath: string
       if (state?.exists_flag === 1 && syncRoot) {
-        await copyFile(resolveWithinRoot(syncRoot, file.relative_path), targetPath)
+        const source = resolveWithinRoot(syncRoot, file.relative_path)
+        targetPath = await copyToUniquePath(source, targetDirectory, fileName)
       } else {
         if (file.current_version <= 0) continue
-        if (desktopStorageRouter) {
-          await desktopStorageRouter.downloadCurrentTo(id, targetPath)
-        } else {
-          const remote = await api.downloadCurrent(id)
-          await writeFile(targetPath, remote.bytes)
-        }
+        targetPath = await downloadToUniquePath(targetDirectory, fileName, async (temporaryPath) => {
+          if (desktopStorageRouter) await desktopStorageRouter.downloadCurrentTo(id, temporaryPath)
+          else {
+            const remote = await api.downloadCurrent(id)
+            await writeFile(temporaryPath, remote.bytes, { flag: 'wx' })
+          }
+        })
       }
       db.log('FILE_DOWNLOADED', id, targetPath)
       downloaded.push(targetPath)
@@ -947,19 +1096,23 @@ function registerIpc(): void {
     await renameOrMoveManagedFile(id, path)
   })
 
-  handleIpc('files:copy', async (fileId: unknown) => {
+  handleIpc('files:copy', async (fileId: unknown, targetFolder: unknown = undefined) => {
     const id = z.string().uuid().parse(fileId)
+    const requestedFolder = z.string().max(1000).optional().parse(targetFolder)
     const { db, sync } = requireServices()
     const file = db.getFile(id)
     const root = db.getSettings().syncDirectory
-    if (!file || !root) throw new Error('FILE_NOT_FOUND')
+    if (!file || !root || file.cloud_status !== 'active') throw new Error('FILE_NOT_FOUND')
     const local = await ensureLocalFile(id)
     const parts = parse(file.logical_name)
-    const parent = dirname(file.relative_path)
-    const targetDirectory = parent === '.' ? resolve(root) : resolveWithinRoot(root, parent)
-    await mkdir(targetDirectory, { recursive: true })
-    const destination = await nextAvailableImportPath(targetDirectory, `${parts.name} - 副本${parts.ext}`)
-    await copyFile(local.absolute, destination)
+    const siblingParent = dirname(safeRelativePath(file.relative_path)).replaceAll('\\', '/')
+    const destinationFolder = requestedFolder === undefined
+      ? (siblingParent === '.' ? '' : siblingParent)
+      : (requestedFolder.trim() ? safeRelativePath(requestedFolder) : '')
+    const targetDirectory = destinationFolder ? resolveWithinRoot(root, destinationFolder) : resolve(root)
+    const targetInfo = await lstat(targetDirectory)
+    if (targetInfo.isSymbolicLink() || !targetInfo.isDirectory()) throw new Error('FOLDER_NOT_FOUND')
+    const destination = await copyToUniquePath(local.absolute, targetDirectory, `${parts.name} - 副本${parts.ext}`)
     await sync.handleFileReady(destination)
     sendStateChanged()
   })
@@ -1394,19 +1547,20 @@ async function requestGracefulQuit(): Promise<void> {
   shutdownInProgress = true
   quitting = true
   try {
-    if (localDb && sessionStore && syncEngine) {
-      const settings = localDb.getSettings()
-      const storedSession = await sessionStore.load()
-      if (storedSession && settings.autoSync) {
-        // flushBeforeExit first drains any watcher debounce that has not reached
-        // pending_sync yet, so save-and-immediately-exit cannot lose the last edit.
+    if (syncEngine) {
+      // Always drain watcher debounce so local work is durable on paused and
+      // signed-out exits too. flushBeforeExit itself gates cloud work.
+      if (!syncEngine.isPaused() && localDb?.getSettings().autoSync) {
         tray?.setToolTip(`${APP_NAME} — 正在完成退出前同步…`)
-        await syncEngine.flushBeforeExit()
       }
+      await syncEngine.flushBeforeExit()
     }
   } catch (error) {
     localDb?.log('SHUTDOWN_SYNC_ERROR', null, error instanceof Error ? error.message : String(error))
   } finally {
+    await syncEngine?.stop().catch((error) => {
+      localDb?.log('SYNC_ENGINE_STOP_ERROR', null, error instanceof Error ? error.message : String(error))
+    })
     await telegramUserStorage?.stop().catch(() => undefined)
     await clearVersionPreviewCache(versionPreviewCacheRoot()).catch(() => undefined)
     finalQuitReady = true
@@ -1539,7 +1693,5 @@ app.on('window-all-closed', () => {
 })
 
 app.on('quit', () => {
-  void syncEngine?.stop()
-  void telegramUserStorage?.stop()
   localDb?.close()
 })

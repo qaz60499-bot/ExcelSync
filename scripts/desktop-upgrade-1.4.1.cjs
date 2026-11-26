@@ -5,7 +5,18 @@ const { spawnSync } = require('node:child_process')
 const root = resolve(__dirname, '..')
 const userProfile = process.env.USERPROFILE || process.env.HOME
 if (!userProfile) throw new Error('USER_PROFILE_NOT_FOUND')
-const desktop = join(userProfile, 'Desktop')
+
+function resolveDesktop() {
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-Command', "[Environment]::GetFolderPath('Desktop')"],
+    { encoding: 'utf8' }
+  )
+  const resolved = String(result.stdout || '').trim()
+  return result.status === 0 && resolved ? resolved : join(userProfile, 'Desktop')
+}
+
+const desktop = resolveDesktop()
 const target = join(root, 'dist', 'win-unpacked', 'ExcelSync.exe')
 const shortcut = join(desktop, 'ExcelSync.lnk')
 const cleanup = join(desktop, 'ExcelSync-Cleanup-Old-Versions.cmd')

@@ -47,6 +47,8 @@ type TaskTemplate = { id: TaskTemplateId; title: string; description: string; de
 
 const USER_TASKS_STORAGE_KEY = 'excel-sync-user-tasks-v2'
 const LEGACY_USER_TASKS_STORAGE_KEY = 'excel-sync-user-tasks-v1'
+const CLOUD_REFRESH_INTERVAL_MS = 5 * 60_000
+const CLOUD_REFRESH_FAILURE_COOLDOWN_MS = 30_000
 const SYSTEM_ROLE_LABELS: Record<SystemRole, string> = { OWNER: 'Owner', ADMIN: '管理员', MEMBER: '成员' }
 const WORKSPACE_ROLE_LABELS: Record<CloudWorkspaceRole, string> = { MANAGER: '负责人', EDITOR: '编辑者', VIEWER: '查看者' }
 const TASK_TEMPLATES: TaskTemplate[] = [
@@ -59,6 +61,10 @@ const TASK_TEMPLATES: TaskTemplate[] = [
 ]
 
 const EMPTY_AUTH: AuthState = { authenticated: false }
+
+function authRefreshScopeKey(state: AuthState): string {
+  return `${state.authenticated ? state.user?.id ?? 'authenticated' : 'signed-out'}:${state.defaultWorkspaceId ?? ''}`
+}
 
 function cloudTaskToUserTask(task: UserTaskView): UserTask {
   const status: UserTaskStatus = task.status === 'DONE' ? 'done' : task.status === 'IN_PROGRESS' ? 'running' : 'todo'
@@ -115,13 +121,38 @@ function storageBackendLabel(backend?: 'telegram_user_group' | 'telegram_bot' | 
   return backend === 'telegram_user_group' ? 'Telegram 私人群组' : backend === 'telegram_bot' ? 'Telegram Bot' : '存储未知'
 }
 
+function fileParentPath(relativePath: string): string {
+  return relativePath.replaceAll('\\', '/').split('/').slice(0, -1).join('/')
+}
+
+function pendingStageLabel(task: PendingView): string {
+  if (task.syncStage === 'waiting') return '本地已保存 · 等待上传'
+  if (task.syncStage === 'checking') return '正在检查文件'
+  if (task.syncStage === 'uploading') return '正在上传文件'
+  if (task.syncStage === 'commit_pending') return task.hasUploadReceipt ? '文件已上传 · 正在提交记录' : '正在确认云端提交'
+  if (task.status === 'RETRY_WAIT') return '等待重试'
+  if (task.status === 'ERROR') return '需要处理'
+  if (task.status === 'CONFLICT') return '需要处理冲突'
+  if (task.status === 'UPLOADING') return '正在同步'
+  return '等待处理'
+}
+
+function pendingErrorLabel(task: PendingView): string {
+  if (!task.errorCode && !task.errorMessage) return '—'
+  if (task.errorCode) {
+    const localized = errorMessage(new Error(task.errorCode))
+    if (localized !== task.errorCode) return localized
+  }
+  return errorMessage(new Error(task.errorMessage ?? task.errorCode ?? ''))
+}
+
 const ACTIVITY_LABELS: Record<string, string> = {
   RENAMED: '本地文件已重命名',
   PENDING: '已加入同步队列',
   RENAME_PENDING: '重命名等待同步',
-  LOCAL_COPY_REMOVED: '本地副本已删除，云端保留',
+  LOCAL_COPY_REMOVED: '本地副本已移除（云端版本保留）',
   LOCAL_COPY_RESTORED: '已恢复本地副本',
-  SAAS_TRASHED: '已移入 SaaS 回收站',
+  SAAS_TRASHED: '云端记录已移入 SaaS 回收站（本地副本保留）',
   SAAS_TRASH_RESTORED: '已从 SaaS 回收站恢复',
   LEGACY_DELETE_QUEUE_CLEARED: '已清除旧版自动删除队列',
   LEGACY_DELETE_IGNORED: '已忽略旧版自动删除请求',
@@ -171,6 +202,11 @@ function errorMessage(error: unknown): string {
     D1_DAILY_READ_LIMIT: 'Cloudflare D1 今日免费读取额度已用完；额度会在 UTC 00:00 重置。',
     WORKER_URL_MUST_USE_HTTPS: 'Worker 地址必须使用 HTTPS。',
     SYNC_DIRECTORY_NOT_CONFIGURED: '请先在“设置”中选择同步文件夹。',
+    SYNC_DIRECTORY_UNAVAILABLE: '同步文件夹当前不可访问，请在设置中检查目录。',
+    FOLDER_LIST_LIMIT_EXCEEDED: '同步目录层级或文件夹数量超过浏览上限，请缩小目录范围。',
+    FOLDER_NOT_FOUND: '所选目标文件夹已不存在或不可访问，请刷新文件夹列表后重试。',
+    LOCAL_FILE_NOT_AVAILABLE: '本机文件当前不可用；可以使用“定位”查看同步目录中的位置。',
+    PATH_REJECTED: '为保护文件安全，已拒绝访问包含无效路径或链接的目录。',
     FILE_NOT_FOUND: '找不到该文件。',
     UNSUPPORTED_EXCEL_FILE: '该文件类型不在当前支持列表中。',
     UNSUPPORTED_FILE_TYPE: '该文件类型不在当前支持列表中。',
@@ -188,10 +224,15 @@ function errorMessage(error: unknown): string {
     TELEGRAM_CODE_EXPIRED: 'Telegram 验证码已过期，请重新发送验证码。',
     TELEGRAM_2FA_INVALID: 'Telegram 2FA 密码不正确，请重新输入。',
     TELEGRAM_RATE_LIMITED: 'Telegram 请求过于频繁，请稍后再试。',
+    UPLOAD_OUTCOME_UNCERTAIN: '上传结果暂时无法确认。请保留本地文件，先检查云端状态，再决定是否手动重试。',
+    INVALID_UPLOAD_RECEIPT: '存储返回的上传凭据校验失败。请保留本地文件，检查存储授权后再手动重试。',
     DOWNLOAD_HASH_MISMATCH: '下载完整性校验失败，已拒绝覆盖正式文件。',
+    DOWNLOAD_NOT_CREATED: '下载未生成有效文件，请检查网络和存储连接后重试。',
     IMPORT_TOO_MANY_FILES: '这个文件夹里的可同步文件过多，一次最多导入 20,000 个。',
     LOCAL_PATH_OCCUPIED: '本地已有其他文件占用了同一个同步路径。',
     PATH_ALREADY_EXISTS: '云端已经存在同一路径的文件。',
+    FILE_HAS_PENDING_SYNC: '该文件仍有待处理同步任务。请先完成或重试队列任务；本地文件会保留。',
+    TASK_NOT_CANCELLABLE: '上传已完成但云端提交尚未确认。请使用“重试”完成提交；本地文件和上传凭据会保留。',
     FILE_LOCKED: '该文件正在被其他设备编辑。请先请求接管，或由管理员强制接管。',
     LEASE_LOST: '当前设备的编辑锁已失效或被接管，请重新打开文件。',
     LOCK_TAKEOVER_FORBIDDEN: '当前账号没有强制接管编辑锁的权限。',
@@ -408,18 +449,35 @@ function PreviewDrawer({ file, preview, presence, activity, loading, canEdit, ca
   useEffect(() => {
     if (!file) { setLease(null); setComments([]); return }
     let active = true
+    let requestInFlight = false
     const refresh = async (): Promise<void> => {
-      const [nextLease, nextComments] = await Promise.all([
-        window.excelSync.fileLease(file.id).catch(() => null),
-        window.excelSync.comments(file.id).catch(() => [] as FileCommentView[])
-      ])
-      if (!active) return
-      setLease(nextLease)
-      setComments(nextComments)
+      if (!active || requestInFlight || document.visibilityState !== 'visible') return
+      requestInFlight = true
+      try {
+        const [nextLease, nextComments] = await Promise.all([
+          window.excelSync.fileLease(file.id).catch(() => null),
+          window.excelSync.comments(file.id).catch(() => [] as FileCommentView[])
+        ])
+        if (active) {
+          setLease(nextLease)
+          setComments(nextComments)
+        }
+      } finally {
+        requestInFlight = false
+      }
     }
     void refresh()
+    const onFocus = (): void => { void refresh() }
+    const onVisibilityChange = (): void => { void refresh() }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     const timer = window.setInterval(() => void refresh(), 30_000)
-    return () => { active = false; window.clearInterval(timer) }
+    return () => {
+      active = false
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.clearInterval(timer)
+    }
   }, [file?.id])
   if (!file) return null
   const activeFile = file
@@ -625,7 +683,7 @@ function TasksPage({ tasks, uiTasks, userTasks, currentUserName, canEditFiles, d
 
     <section className="panel table-panel">
       <div className="panel-header"><div><h3>系统同步队列</h3><p className="muted">这是 ExcelSync 自动生成的真实文件任务；冲突必须明确选择处理方式。</p></div><span className="count-pill">{tasks.length}</span></div>
-      {tasks.length === 0 ? <div className="empty-state compact">当前没有系统待处理任务。</div> : <div className="table-wrap"><table><thead><tr><th>文件</th><th>任务</th><th>优先级</th><th>状态</th><th>尝试次数</th><th>更新时间</th><th>错误</th><th>操作</th></tr></thead><tbody>{tasks.map((task) => <tr key={task.id}><td><b>{task.logicalName}</b></td><td>{operationLabel[task.operation]}</td><td><span className="queue-priority">P{task.priority}</span></td><td><span className={`status-chip ${task.status.toLowerCase()}`}>{STATUS_LABELS[task.status]}</span></td><td>{task.attemptCount}</td><td>{formatTime(task.updatedAt)}</td><td>{task.status === 'CONFLICT' ? '本地和云端均有新版本，请选择保留方式。' : task.errorMessage ? errorMessage(new Error(task.errorMessage)) : '—'}</td><td className="actions-cell">{!canEditFiles ? <span className="muted">只读</span> : task.status === 'CONFLICT' ? <div className="conflict-actions"><button className="text-button" onClick={() => void onResolveConflict(task, 'local')}>保留本地</button><button className="text-button" onClick={() => void onResolveConflict(task, 'cloud')}>保留云端</button><button className="text-button" onClick={() => void onResolveConflict(task, 'both')}>两个都保留</button></div> : <>{['ERROR', 'RETRY_WAIT'].includes(task.status) && <button className="text-button" onClick={() => void onRetry(task)}>重试</button>}{task.status !== 'UPLOADING' && <button className="text-button danger" onClick={() => void onCancel(task)}>取消</button>}</>}</td></tr>)}</tbody></table></div>}
+      {tasks.length === 0 ? <div className="empty-state compact">当前没有系统待处理任务。</div> : <div className="table-wrap"><table><thead><tr><th>文件</th><th>任务</th><th>优先级</th><th>状态</th><th>同步阶段 / 存储</th><th>尝试次数</th><th>阶段更新时间</th><th>下次重试</th><th>最后错误</th><th>操作</th></tr></thead><tbody>{tasks.map((task) => { const cancelDisabled = task.status === 'UPLOADING' || Boolean(task.hasUploadReceipt); const cancelReason = task.hasUploadReceipt ? '文件已上传，不能取消；请使用“重试”完成云端提交。' : '文件正在上传，当前不能取消。'; return <tr key={task.id}><td><b>{task.logicalName}</b></td><td>{operationLabel[task.operation]}</td><td><span className="queue-priority">P{task.priority}</span></td><td><span className={`status-chip ${task.status.toLowerCase()}`}>{STATUS_LABELS[task.status]}</span></td><td><div className="queue-stage"><b>{pendingStageLabel(task)}</b><small>{storageBackendLabel(task.storageBackend)}</small></div></td><td>{task.attemptCount}</td><td>{formatTime(task.updatedAt)}</td><td>{task.nextRetryAt ? formatTime(task.nextRetryAt) : '—'}</td><td className="queue-error">{task.status === 'CONFLICT' ? '本地和云端均有新版本，请选择保留方式。' : pendingErrorLabel(task)}{task.errorCode && <small>{task.errorCode}</small>}</td><td className="actions-cell">{!canEditFiles ? <span className="muted">只读</span> : task.status === 'CONFLICT' ? <div className="conflict-actions"><button className="text-button" onClick={() => void onResolveConflict(task, 'local')}>保留本地</button><button className="text-button" onClick={() => void onResolveConflict(task, 'cloud')}>保留云端</button><button className="text-button" onClick={() => void onResolveConflict(task, 'both')}>两个都保留</button></div> : <>{['ERROR', 'RETRY_WAIT'].includes(task.status) && <button className="text-button" onClick={() => void onRetry(task)}>重试</button>}{cancelDisabled ? <button className="text-button danger" disabled title={cancelReason}>取消</button> : <button className="text-button danger" onClick={() => void onCancel(task)}>取消</button>}</>}</td></tr> })}</tbody></table></div>}
     </section>
 
     <section className="panel">
@@ -637,10 +695,17 @@ function TasksPage({ tasks, uiTasks, userTasks, currentUserName, canEditFiles, d
   </div>
 }
 
-function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPreview, onVersions, onRestoreLocal, onTrash, onDownload, onRename, onMove, onCopy, onFavorite, onCreateTaskForFile, onCreateFolder, onDropFiles, onBulkDownload, onBulkMove, onBulkTrash, onImport, onImportFolder, busyAction, busyFileId }: {
+function FilesPage({ files, destinationFiles = files, folderPaths, folderListError, folderListLoaded, onRefreshFolders, pendingTasks, locateRequest, title = '文件', readOnly = false, onOpen, onPreview, onVersions, onRestoreLocal, onTrash, onDownload, onRename, onMove, onCopy, onBulkCopy, onFavorite, onLocateFile, onShowInFolder, onCreateTaskForFile, onCreateFolder, onDropFiles, onBulkDownload, onBulkMove, onBulkTrash, onImport, onImportFolder, onToast, busyAction, busyFileId }: {
   title?: string
   readOnly?: boolean
   files: LocalFileView[]
+  destinationFiles?: LocalFileView[]
+  folderPaths: string[]
+  folderListError: string
+  folderListLoaded: boolean
+  onRefreshFolders: () => Promise<void>
+  pendingTasks: PendingView[]
+  locateRequest: { fileId: string; sequence: number } | null
   onOpen: (id: string) => Promise<void>
   onPreview: (file: LocalFileView) => Promise<void>
   onVersions: (file: LocalFileView) => Promise<void>
@@ -648,17 +713,21 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
   onTrash: (file: LocalFileView) => Promise<void>
   onDownload: (file: LocalFileView) => Promise<void>
   onRename: (file: LocalFileView) => Promise<void>
-  onMove: (file: LocalFileView) => Promise<void>
-  onCopy: (file: LocalFileView) => Promise<void>
+  onMove: (file: LocalFileView, destination: string) => Promise<void>
+  onCopy: (file: LocalFileView, targetFolder?: string) => Promise<void>
+  onBulkCopy: (files: LocalFileView[], targetFolder: string) => Promise<void>
   onFavorite: (file: LocalFileView) => Promise<void>
+  onLocateFile: (file: LocalFileView) => void
+  onShowInFolder: (file: LocalFileView) => Promise<void>
   onCreateTaskForFile: (file: LocalFileView) => void
   onCreateFolder: (parent: string) => Promise<void>
   onDropFiles: (files: File[]) => Promise<void>
   onBulkDownload: (files: LocalFileView[]) => Promise<void>
-  onBulkMove: (files: LocalFileView[]) => Promise<void>
+  onBulkMove: (files: LocalFileView[], destination: string) => Promise<void>
   onBulkTrash: (files: LocalFileView[]) => Promise<void>
   onImport: () => Promise<void>
   onImportFolder: () => Promise<void>
+  onToast: (message: string) => void
   busyAction: ActionKey | null
   busyFileId: string | null
 }): ReactElement {
@@ -670,6 +739,11 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
   const [dragging, setDragging] = useState(false)
   const [pageIndex, setPageIndex] = useState(0)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: LocalFileView; mode: 'more' | 'context' } | null>(null)
+  const [focusedFileId, setFocusedFileId] = useState<string | null>(null)
+  const [moveDialog, setMoveDialog] = useState<{ files: LocalFileView[]; mode: 'move' | 'copy' } | null>(null)
+  const [moveDestination, setMoveDestination] = useState('')
+  const [moveFolderSearch, setMoveFolderSearch] = useState('')
+  const [moveBusy, setMoveBusy] = useState(false)
   const lastSelectedId = useRef<string | null>(null)
   useEffect(() => {
     if (!contextMenu) return
@@ -678,6 +752,59 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
     window.addEventListener('blur', close)
     return () => { window.removeEventListener('click', close); window.removeEventListener('blur', close) }
   }, [contextMenu])
+  const pendingByFileId = useMemo(() => {
+    const latest = new Map<string, PendingView>()
+    for (const task of [...pendingTasks].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))) {
+      if (!latest.has(task.fileId)) latest.set(task.fileId, task)
+    }
+    return latest
+  }, [pendingTasks])
+  const folderTreePaths = useMemo(() => {
+    const paths = new Set<string>()
+    for (const path of folderPaths) {
+      const clean = path.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '')
+      if (clean) paths.add(clean)
+    }
+    for (const file of destinationFiles) {
+      if (!file.exists) continue
+      const parent = fileParentPath(file.relativePath)
+      let path = ''
+      for (const segment of parent.split('/').filter(Boolean)) {
+        path = path ? `${path}/${segment}` : segment
+        paths.add(path)
+      }
+    }
+    return [...paths].sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right, 'zh-CN'))
+  }, [destinationFiles, folderPaths])
+  const destinationFolders = useMemo(() => {
+    const paths = new Set<string>([''])
+    for (const path of folderPaths) {
+      const clean = path.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '')
+      if (clean) paths.add(clean)
+    }
+    for (const file of destinationFiles) {
+      if (!file.exists) continue
+      let path = ''
+      for (const segment of fileParentPath(file.relativePath).split('/').filter(Boolean)) {
+        path = path ? `${path}/${segment}` : segment
+        paths.add(path)
+      }
+    }
+    return ['', ...[...paths].filter(Boolean).sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right, 'zh-CN'))]
+  }, [destinationFiles, folderPaths])
+  const visibleDestinationFolders = destinationFolders.filter((path) => !moveFolderSearch.trim() || (path || '同步根目录').toLocaleLowerCase('zh-CN').includes(moveFolderSearch.trim().toLocaleLowerCase('zh-CN')))
+  useEffect(() => {
+    if (!locateRequest) return
+    const target = files.find((file) => file.id === locateRequest.fileId)
+    if (!target) return
+    setFolderPath(fileParentPath(target.relativePath))
+    setPartition('all')
+    setSearchQuery('')
+    setSelectedIds(new Set())
+    setFocusedFileId(target.id)
+    const timer = window.setTimeout(() => setFocusedFileId((current) => current === target.id ? null : current), 3500)
+    return () => window.clearTimeout(timer)
+  }, [locateRequest, files])
   const normalizedFolder = folderPath.replace(/^\/+|\/+$/g, '')
   const prefix = normalizedFolder ? `${normalizedFolder}/` : ''
   const folders = new Map<string, number>()
@@ -707,6 +834,14 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
     }
   }
 
+  if (!normalizedSearch && partition === 'all') {
+    for (const path of folderTreePaths) {
+      if (fileParentPath(path) !== normalizedFolder) continue
+      const name = path.split('/').at(-1)
+      if (name && !folders.has(name)) folders.set(name, 0)
+    }
+  }
+
   const folderRows = [...folders.entries()].sort(([a], [b]) => a.localeCompare(b, 'zh-CN'))
   const crumbs = normalizedFolder ? normalizedFolder.split('/') : []
   const pageSize = 250
@@ -718,6 +853,7 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
   const allVisibleSelected = visibleFiles.length > 0 && visibleFiles.every((file) => selectedIds.has(file.id))
   useEffect(() => { setPageIndex(0) }, [normalizedFolder, partition, normalizedSearch])
   const enterFolder = (name: string): void => { setFolderPath(prefix + name); setSelectedIds(new Set()) }
+  const enterFolderPath = (path: string): void => { setFolderPath(path); setPartition('all'); setSearchQuery(''); setSelectedIds(new Set()) }
   const goToCrumb = (index: number): void => { setFolderPath(crumbs.slice(0, index + 1).join('/')); setSelectedIds(new Set()) }
   const goUp = (): void => { setFolderPath(crumbs.slice(0, -1).join('/')); setSelectedIds(new Set()) }
 
@@ -752,10 +888,51 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
 
   function openFileMenu(file: LocalFileView, x: number, y: number, mode: 'more' | 'context'): void {
     const menuWidth = 224
-    const menuHeight = mode === 'context' ? (file.currentVersion > 0 ? 470 : 410) : (file.currentVersion > 0 ? 380 : 320)
+    const menuHeight = mode === 'context' ? (file.currentVersion > 0 ? 515 : 455) : (file.currentVersion > 0 ? 380 : 320)
     const left = Math.max(12, Math.min(x, window.innerWidth - menuWidth - 12))
     const top = Math.max(12, Math.min(y, window.innerHeight - menuHeight - 12))
     setContextMenu({ x: left, y: top, file, mode })
+  }
+
+  function beginMove(rows: LocalFileView[]): void {
+    if (rows.length === 0) return
+    const parents = [...new Set(rows.map((file) => fileParentPath(file.relativePath)))]
+    const defaultParent = parents.length === 1 && destinationFolders.includes(parents[0]!) ? parents[0]! : ''
+    setMoveDestination(defaultParent)
+    setMoveFolderSearch('')
+    setMoveDialog({ files: rows, mode: 'move' })
+  }
+
+  function beginCopy(rows: LocalFileView[]): void {
+    if (rows.length === 0) return
+    const parents = [...new Set(rows.map((file) => fileParentPath(file.relativePath)))]
+    const defaultParent = parents.length === 1 && destinationFolders.includes(parents[0]!) ? parents[0]! : ''
+    setMoveDestination(defaultParent)
+    setMoveFolderSearch('')
+    setMoveDialog({ files: rows, mode: 'copy' })
+  }
+
+  function cancelMoveDialog(): void {
+    if (!moveDialog || moveBusy) return
+    onToast(moveDialog.mode === 'copy' ? '已取消复制。' : '已取消移动。')
+    setMoveDialog(null)
+  }
+
+  async function submitMove(): Promise<void> {
+    if (!moveDialog || moveBusy) return
+    setMoveBusy(true)
+    try {
+      if (moveDialog.mode === 'copy') {
+        if (moveDialog.files.length === 1) await onCopy(moveDialog.files[0]!, moveDestination)
+        else await onBulkCopy(moveDialog.files, moveDestination)
+      } else if (moveDialog.files.length === 1) await onMove(moveDialog.files[0]!, moveDestination)
+      else await onBulkMove(moveDialog.files, moveDestination)
+      setMoveDialog(null)
+    } catch (error) {
+      onToast(errorMessage(error))
+    } finally {
+      setMoveBusy(false)
+    }
   }
 
   return (
@@ -769,7 +946,7 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
       {dragging && !readOnly && <div className="drop-overlay">拖放到这里即可添加文件或文件夹</div>}
       <div className="panel-header"><div><h2>{title}</h2><p className="muted">{readOnly ? '当前 Workspace 为查看权限：可以预览和下载，但不能上传、移动、重命名或删除。' : '选择文件即可在右侧快速预览；双击用系统默认程序打开。支持拖放添加。'}</p></div><div className="top-actions"><span className="count-pill">{files.length}</span>{!readOnly && <><button className="secondary" onClick={() => void onCreateFolder(normalizedFolder)}>新建文件夹</button><ActionButton actionKey="importFolder" label="上传文件夹" className="secondary" busyAction={busyAction} onClick={() => void onImportFolder()} /><ActionButton actionKey="importFiles" label="＋ 添加文件" className="primary" busyAction={busyAction} onClick={() => void onImport()} /></>}</div></div>
 
-      {selectedFiles.length > 0 ? <div className="selection-toolbar"><b>已选择 {selectedFiles.length} 项</b><button onClick={() => void onBulkDownload(selectedFiles)}>下载</button>{!readOnly && <><button onClick={() => void onBulkMove(selectedFiles)}>移动</button><button className="danger" onClick={() => void onBulkTrash(selectedFiles)}>删除</button></>}<button className="text-button" onClick={() => setSelectedIds(new Set())}>取消选择</button></div> : <div className="file-search-row"><input aria-label="搜索文件" placeholder="搜索文件名、文件夹、路径、类型…" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />{searchQuery && <button className="text-button" onClick={() => setSearchQuery('')}>清除</button>}</div>}
+      {selectedFiles.length > 0 ? <div className="selection-toolbar"><b>已选择 {selectedFiles.length} 项</b><button onClick={() => void onBulkDownload(selectedFiles)}>下载</button>{!readOnly && <><button onClick={() => beginCopy(selectedFiles)}>复制到…</button><button onClick={() => beginMove(selectedFiles)}>移动</button><button className="danger" onClick={() => void onBulkTrash(selectedFiles)}>移入云端回收站</button></>}<button className="text-button" onClick={() => setSelectedIds(new Set())}>取消选择</button></div> : <div className="file-search-row"><input aria-label="搜索文件" placeholder="搜索文件名、文件夹、路径、类型…" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />{searchQuery && <button className="text-button" onClick={() => setSearchQuery('')}>清除</button>}</div>}
 
       <div className="file-category-tabs" role="tablist" aria-label="文件类型">
         <button className={partition === 'all' ? 'active' : ''} onClick={() => setPartition('all')}>全部 <span>{files.length}</span></button>
@@ -778,14 +955,17 @@ function FilesPage({ files, title = '文件', readOnly = false, onOpen, onPrevie
 
       {!normalizedSearch && <div className="folder-toolbar"><button className="text-button" onClick={() => { setFolderPath(''); setSelectedIds(new Set()) }}>同步根目录</button>{crumbs.map((crumb, index) => <span className="breadcrumb-part" key={`${crumb}-${index}`}><span>/</span><button className="text-button" onClick={() => goToCrumb(index)}>{crumb}</button></span>)}{normalizedFolder && <button className="secondary folder-up" onClick={goUp}>返回上一级</button>}</div>}
 
-      {files.length === 0 ? <div className="empty-state">{readOnly ? '当前 Workspace 还没有可查看的文件。' : '还没有文件。点击“＋ 添加文件”、上传文件夹，或直接把文件拖到这里。'}</div> : <>
-        {folderRows.length > 0 && <div className="folder-grid">{folderRows.map(([name, count]) => <button className="folder-card" key={name} onDoubleClick={() => enterFolder(name)} onClick={() => enterFolder(name)}><span className="folder-icon">▰</span><span><b>{name}</b><small>{count} 个文件</small></span><span className="folder-enter">打开 ›</span></button>)}</div>}
+      <details className="folder-tree" open><summary>文件夹树</summary><nav className="folder-tree-list" aria-label="同步文件夹树"><button type="button" className={`folder-tree-item${normalizedFolder ? '' : ' active'}`} onClick={() => enterFolderPath('')}><span>⌂</span><b>同步根目录</b></button>{folderTreePaths.map((path) => { const depth = path.split('/').length - 1; const name = path.split('/')[depth]!; return <button type="button" className={`folder-tree-item${normalizedFolder === path ? ' active' : ''}`} key={path} aria-label={`打开文件夹 ${path}`} title={path} style={{ paddingLeft: `${12 + depth * 16}px` }} onClick={() => enterFolderPath(path)}><span>▰</span><b>{name}</b></button> })}</nav><div className="folder-tree-footer">{folderListError ? <span role="status">读取本机文件夹失败：{folderListError}</span> : !folderListLoaded ? <span>正在读取本机文件夹…</span> : <span>{folderTreePaths.length} 个文件夹 · 包含空文件夹</span>}<button type="button" className="text-button" onClick={() => void onRefreshFolders()}>刷新</button></div></details>
 
-        {visibleFiles.length > 0 && <><div className="table-wrap"><table className="file-table"><thead><tr><th className="select-column"><input aria-label="全选当前筛选结果" type="checkbox" checked={allVisibleSelected} onChange={() => setSelectedIds(allVisibleSelected ? new Set() : new Set(visibleFiles.map((file) => file.id)))} /></th><th>文件</th><th>状态</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>{pagedFiles.map((file) => <tr key={file.id} className={selectedIds.has(file.id) ? 'selected' : ''} onClick={(event) => selectFile(file, event)} onDoubleClick={() => void onOpen(file.id)} onContextMenu={(event) => { event.preventDefault(); openFileMenu(file, event.clientX, event.clientY, 'context') }}><td className="select-column" onClick={(event) => event.stopPropagation()}><input aria-label={`选择 ${file.logicalName}`} type="checkbox" checked={selectedIds.has(file.id)} onChange={() => toggleCheckbox(file)} /></td><td><div className="file-name"><span className="file-icon">{extensionLabel(file.logicalName)}</span><div><b>{file.logicalName}</b><small>{file.relativePath}</small></div></div></td><td><span className={`status-chip ${fileStatusClass(file)}`}>{fileStatusLabel(file)}</span></td><td>{formatBytes(file.size)}</td><td>{formatTime(file.mtimeMs || file.updatedAt)}</td><td className="actions-cell" onClick={(event) => event.stopPropagation()}><button className="text-button" onClick={() => void onPreview(file)}>预览</button><button className="text-button" onClick={() => void onOpen(file.id)}>打开</button>{!file.exists && file.currentVersion > 0 && <button className="text-button" onClick={() => void onRestoreLocal(file)} disabled={busyFileId === file.id}>下载到本地</button>}<button className="text-button file-more-button" aria-haspopup="menu" aria-expanded={contextMenu?.mode === 'more' && contextMenu.file.id === file.id} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); openFileMenu(file, rect.right - 224, rect.bottom + 7, 'more') }}>更多</button></td></tr>)}</tbody></table></div>{pageCount > 1 && <div className="file-pagination"><span>显示 {pageStart + 1}–{Math.min(pageStart + pageSize, visibleFiles.length)} / {visibleFiles.length}</span><div><button className="secondary" disabled={safePageIndex === 0} onClick={() => setPageIndex(Math.max(0, safePageIndex - 1))}>上一页</button><b>{safePageIndex + 1} / {pageCount}</b><button className="secondary" disabled={safePageIndex >= pageCount - 1} onClick={() => setPageIndex(Math.min(pageCount - 1, safePageIndex + 1))}>下一页</button></div></div>}</>}
+      {files.length === 0 && folderTreePaths.length === 0 ? <div className="empty-state">{readOnly ? '当前 Workspace 还没有可查看的文件。' : '还没有文件。点击“＋ 添加文件”、上传文件夹，或直接把文件拖到这里。'}</div> : <>
+        {folderRows.length > 0 && <div className="folder-grid">{folderRows.map(([name, count]) => <button className="folder-card" key={name} onDoubleClick={() => enterFolder(name)} onClick={() => enterFolder(name)}><span className="folder-icon">▰</span><span><b>{name}</b><small>{count > 0 ? `${count} 个文件` : '暂无文件'}</small></span><span className="folder-enter">打开 ›</span></button>)}</div>}
 
-        {folderRows.length === 0 && visibleFiles.length === 0 && <div className="empty-state compact">没有匹配的文件。</div>}
+        {visibleFiles.length > 0 && <><div className="table-wrap"><table className="file-table"><thead><tr><th className="select-column"><input aria-label="全选当前筛选结果" type="checkbox" checked={allVisibleSelected} onChange={() => setSelectedIds(allVisibleSelected ? new Set() : new Set(visibleFiles.map((file) => file.id)))} /></th><th>文件</th><th>状态</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>{pagedFiles.map((file) => { const pending = pendingByFileId.get(file.id); return <tr key={file.id} className={`${selectedIds.has(file.id) ? 'selected ' : ''}${focusedFileId === file.id ? 'focused-file' : ''}`} onClick={(event) => selectFile(file, event)} onDoubleClick={() => void onOpen(file.id)} onContextMenu={(event) => { event.preventDefault(); openFileMenu(file, event.clientX, event.clientY, 'context') }}><td className="select-column" onClick={(event) => event.stopPropagation()}><input aria-label={`选择 ${file.logicalName}`} type="checkbox" checked={selectedIds.has(file.id)} onChange={() => toggleCheckbox(file)} /></td><td><div className="file-name"><span className="file-icon">{extensionLabel(file.logicalName)}</span><div><b>{file.logicalName}</b><small>{file.relativePath}</small>{pending && <small className="file-queue-hint">队列 · {pendingStageLabel(pending)}{pending.nextRetryAt ? ` · 下次 ${formatTime(pending.nextRetryAt)}` : ''}</small>}</div></div></td><td><span className={`status-chip ${fileStatusClass(file)}`}>{fileStatusLabel(file)}</span></td><td>{formatBytes(file.size)}</td><td>{formatTime(file.mtimeMs || file.updatedAt)}</td><td className="actions-cell" onClick={(event) => event.stopPropagation()}>{normalizedSearch && <button className="text-button" onClick={() => onLocateFile(file)}>定位</button>}{file.exists ? <button className="text-button" onClick={() => void onShowInFolder(file)}>打开所在文件夹</button> : <button className="text-button" onClick={() => onLocateFile(file)}>定位</button>}<button className="text-button" onClick={() => void onPreview(file)}>预览</button><button className="text-button" onClick={() => void onOpen(file.id)}>打开</button>{!file.exists && file.currentVersion > 0 && <button className="text-button" onClick={() => void onRestoreLocal(file)} disabled={busyFileId === file.id}>下载到本地</button>}<button className="text-button file-more-button" aria-haspopup="menu" aria-expanded={contextMenu?.mode === 'more' && contextMenu.file.id === file.id} onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); openFileMenu(file, rect.right - 224, rect.bottom + 7, 'more') }}>更多</button></td></tr> })}</tbody></table></div>{pageCount > 1 && <div className="file-pagination"><span>显示 {pageStart + 1}–{Math.min(pageStart + pageSize, visibleFiles.length)} / {visibleFiles.length}</span><div><button className="secondary" disabled={safePageIndex === 0} onClick={() => setPageIndex(Math.max(0, safePageIndex - 1))}>上一页</button><b>{safePageIndex + 1} / {pageCount}</b><button className="secondary" disabled={safePageIndex >= pageCount - 1} onClick={() => setPageIndex(Math.min(pageCount - 1, safePageIndex + 1))}>下一页</button></div></div>}</>}
+
+        {visibleFiles.length === 0 && <div className="empty-state compact">{normalizedSearch ? '没有匹配的文件。' : files.length === 0 ? '当前文件夹还没有文件。' : '当前文件夹中没有匹配的文件。'}</div>}
       </>}
-      {contextMenu && <div className={`file-context-menu${contextMenu.mode === 'more' ? ' file-more-popover' : ''}`} role="menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>{contextMenu.mode === 'context' && <><button role="menuitem" onClick={() => { void onOpen(contextMenu.file.id); setContextMenu(null) }}>打开文件</button><button role="menuitem" onClick={() => { void onPreview(contextMenu.file); setContextMenu(null) }}>快速预览</button><div className="menu-separator" /></>}<button role="menuitem" onClick={() => { onCreateTaskForFile(contextMenu.file); setContextMenu(null) }}>创建关联任务</button><button role="menuitem" onClick={() => { void onFavorite(contextMenu.file); setContextMenu(null) }}>{contextMenu.file.favorite ? '取消收藏' : '加入收藏'}</button>{!readOnly && <><button role="menuitem" onClick={() => { void onRename(contextMenu.file); setContextMenu(null) }}>重命名</button><button role="menuitem" onClick={() => { void onMove(contextMenu.file); setContextMenu(null) }}>移动到其他文件夹…</button><button role="menuitem" onClick={() => { void onCopy(contextMenu.file); setContextMenu(null) }}>复制文件</button></>}<div className="menu-separator" /><button role="menuitem" onClick={() => { void onDownload(contextMenu.file); setContextMenu(null) }}>下载副本</button><button role="menuitem" disabled={contextMenu.file.currentVersion === 0} onClick={() => { void onVersions(contextMenu.file); setContextMenu(null) }}>查看历史版本</button>{!readOnly && contextMenu.file.currentVersion > 0 && <><div className="menu-separator" /><button role="menuitem" className="danger" onClick={() => { void onTrash(contextMenu.file); setContextMenu(null) }}>移入回收站</button></>}</div>}
+      {contextMenu && <div className={`file-context-menu${contextMenu.mode === 'more' ? ' file-more-popover' : ''}`} role="menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>{contextMenu.mode === 'context' && <><button role="menuitem" onClick={() => { void onOpen(contextMenu.file.id); setContextMenu(null) }}>打开文件</button><button role="menuitem" onClick={() => { void onPreview(contextMenu.file); setContextMenu(null) }}>快速预览</button>{contextMenu.file.exists ? <button role="menuitem" onClick={() => { void onShowInFolder(contextMenu.file); setContextMenu(null) }}>打开所在文件夹</button> : <button role="menuitem" onClick={() => { onLocateFile(contextMenu.file); setContextMenu(null) }}>在所在文件夹中定位</button>}<div className="menu-separator" /></>}<button role="menuitem" onClick={() => { onCreateTaskForFile(contextMenu.file); setContextMenu(null) }}>创建关联任务</button><button role="menuitem" onClick={() => { void onFavorite(contextMenu.file); setContextMenu(null) }}>{contextMenu.file.favorite ? '取消收藏' : '加入收藏'}</button>{!readOnly && <><button role="menuitem" onClick={() => { void onRename(contextMenu.file); setContextMenu(null) }}>重命名</button><button role="menuitem" onClick={() => { beginMove([contextMenu.file]); setContextMenu(null) }}>移动到其他文件夹…</button><button role="menuitem" onClick={() => { beginCopy([contextMenu.file]); setContextMenu(null) }}>复制到其他文件夹…</button></>}<div className="menu-separator" /><button role="menuitem" onClick={() => { void onDownload(contextMenu.file); setContextMenu(null) }}>下载副本</button><button role="menuitem" disabled={contextMenu.file.currentVersion === 0} onClick={() => { void onVersions(contextMenu.file); setContextMenu(null) }}>查看历史版本</button>{!readOnly && contextMenu.file.currentVersion > 0 && <><div className="menu-separator" /><button role="menuitem" className="danger" onClick={() => { void onTrash(contextMenu.file); setContextMenu(null) }}>移入云端回收站</button></>}</div>}
+      {moveDialog && <div className="modal-backdrop move-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) cancelMoveDialog() }}><section className="move-destination-modal" role="dialog" aria-modal="true" aria-labelledby="move-destination-title" onKeyDown={(event) => { if (event.key === 'Escape') cancelMoveDialog() }} onMouseDown={(event) => event.stopPropagation()}><header className="move-destination-head"><div><p className="eyebrow">{moveDialog.mode === 'copy' ? 'COPY FILES' : 'MOVE FILES'}</p><h3 id="move-destination-title">选择目标文件夹</h3><p>{moveDialog.files.length === 1 ? `${moveDialog.mode === 'copy' ? '复制' : '移动'} ${moveDialog.files[0]!.logicalName}` : `${moveDialog.mode === 'copy' ? '复制' : '移动'} ${moveDialog.files.length} 个文件`}</p></div><button className="icon-close" aria-label="关闭文件操作对话框" disabled={moveBusy} onClick={cancelMoveDialog}>×</button></header><label className="move-destination-search">搜索已有文件夹<input aria-label="搜索目标文件夹" value={moveFolderSearch} onChange={(event) => setMoveFolderSearch(event.target.value)} placeholder="按文件夹名称或路径筛选" autoFocus /></label><div className="move-folder-list" role="radiogroup" aria-label="目标文件夹">{visibleDestinationFolders.map((path) => <button type="button" role="radio" aria-checked={moveDestination === path} className={`move-folder-option${moveDestination === path ? ' active' : ''}`} key={path || '__root__'} style={{ paddingLeft: `${12 + (path ? (path.split('/').length - 1) * 14 : 0)}px` }} onClick={() => setMoveDestination(path)}><span className="move-folder-icon">{path ? '▰' : '⌂'}</span><span><b>{path || '同步根目录'}</b><small>{path ? '现有文件夹' : '同步目录根位置'}</small></span><span className="move-folder-check" aria-hidden="true">{moveDestination === path ? '✓' : ''}</span></button>)}{visibleDestinationFolders.length === 0 && <div className="empty-state compact">没有匹配的现有文件夹。</div>}</div><p className="move-destination-summary" aria-live="polite">{moveDialog.mode === 'copy' ? `将在“${moveDestination || '同步根目录'}”创建副本，并自动使用不冲突的文件名。` : `将文件移至“${moveDestination || '同步根目录'}”；文件名保持不变。`}</p><div className="modal-actions"><button className="secondary" disabled={moveBusy} onClick={cancelMoveDialog}>取消</button><button className="primary" disabled={moveBusy} onClick={() => void submitMove()}>{moveBusy ? '正在处理…' : `${moveDialog.mode === 'copy' ? '复制' : '移动'} ${moveDialog.files.length} 项`}</button></div></section></div>}
     </section>
   )
 }
@@ -810,9 +990,9 @@ function TrashPage({ files, canRestore, canPermanentDelete, onRestore, onPermane
 
   return (
     <section className="panel table-panel">
-      <div className="panel-header"><div><h2>回收站</h2><p className="muted">默认删除可恢复；“永久删除”只在这里提供，避免误操作。</p></div><span className="count-pill">{files.length}</span></div>
+      <div className="panel-header"><div><h2>回收站</h2><p className="muted">移入云端回收站只隐藏 SaaS 记录，不删除本机副本或 Telegram 存储对象。永久移除 SaaS 记录只在这里提供。</p></div><span className="count-pill">{files.length}</span></div>
       {selected.length > 0 ? <div className="selection-toolbar"><b>已选择 {selected.length} 项</b>{canRestore && <button onClick={() => void onBulkRestore(selected)}>批量恢复</button>}<button className="text-button" onClick={() => setSelectedIds(new Set())}>取消选择</button></div> : <div className="file-search-row"><input aria-label="搜索回收站" placeholder="搜索回收站中的文件名或路径…" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />{searchQuery && <button className="text-button" onClick={() => setSearchQuery('')}>清除</button>}</div>}
-      {visible.length === 0 ? <div className="empty-state">{files.length === 0 ? '回收站为空。' : '没有匹配的文件。'}</div> : <div className="table-wrap"><table><thead><tr><th className="select-column"><input aria-label="全选回收站当前列表" type="checkbox" checked={allVisibleSelected} onChange={() => setSelectedIds(allVisibleSelected ? new Set() : new Set(visible.map((file) => file.id)))} /></th><th>文件</th><th>版本</th><th>大小</th><th>删除时间</th><th>原路径</th><th>操作</th></tr></thead><tbody>{visible.map((file) => <tr key={file.id} className={selectedIds.has(file.id) ? 'selected' : ''}><td className="select-column"><input aria-label={`选择 ${file.logicalName}`} type="checkbox" checked={selectedIds.has(file.id)} onChange={() => { const next = new Set(selectedIds); if (next.has(file.id)) next.delete(file.id); else next.add(file.id); setSelectedIds(next) }} /></td><td><div className="file-name"><span className="file-icon">{extensionLabel(file.logicalName)}</span><div><b>{file.logicalName}</b><small>{filePartitionLabel(file.logicalName)}</small></div></div></td><td>V{file.currentVersion}</td><td>{formatBytes(file.size)}</td><td>{formatTime(file.trashedAt)}</td><td>{file.relativePath}</td><td className="actions-cell">{canRestore && <button className="text-button" disabled={busyFileId === file.id} onClick={() => void onRestore(file)}>恢复</button>}{canPermanentDelete && <button className="text-button danger" disabled={busyFileId === file.id} onClick={() => void onPermanentDelete(file)}>永久删除</button>}{!canRestore && !canPermanentDelete && <span className="muted">只读</span>}</td></tr>)}</tbody></table></div>}
+      {visible.length === 0 ? <div className="empty-state">{files.length === 0 ? '回收站为空。' : '没有匹配的文件。'}</div> : <div className="table-wrap"><table><thead><tr><th className="select-column"><input aria-label="全选回收站当前列表" type="checkbox" checked={allVisibleSelected} onChange={() => setSelectedIds(allVisibleSelected ? new Set() : new Set(visible.map((file) => file.id)))} /></th><th>文件</th><th>版本</th><th>大小</th><th>删除时间</th><th>原路径</th><th>操作</th></tr></thead><tbody>{visible.map((file) => <tr key={file.id} className={selectedIds.has(file.id) ? 'selected' : ''}><td className="select-column"><input aria-label={`选择 ${file.logicalName}`} type="checkbox" checked={selectedIds.has(file.id)} onChange={() => { const next = new Set(selectedIds); if (next.has(file.id)) next.delete(file.id); else next.add(file.id); setSelectedIds(next) }} /></td><td><div className="file-name"><span className="file-icon">{extensionLabel(file.logicalName)}</span><div><b>{file.logicalName}</b><small>{filePartitionLabel(file.logicalName)}</small></div></div></td><td>V{file.currentVersion}</td><td>{formatBytes(file.size)}</td><td>{formatTime(file.trashedAt)}</td><td>{file.relativePath}</td><td className="actions-cell">{canRestore && <button className="text-button" disabled={busyFileId === file.id} onClick={() => void onRestore(file)}>恢复 SaaS 记录</button>}{canPermanentDelete && <button className="text-button danger" title="从 SaaS 中永久移除记录；Telegram 存储对象保留" disabled={busyFileId === file.id} onClick={() => void onPermanentDelete(file)}>永久移除记录</button>}{!canRestore && !canPermanentDelete && <span className="muted">只读</span>}</td></tr>)}</tbody></table></div>}
     </section>
   )
 }
@@ -1010,6 +1190,7 @@ function SettingsPage({ settings, onChange, onSave, onChooseDirectory, canManage
   const telegramStateRef = useRef<TelegramUserStorageStatusView['state'] | null>(null)
 
   async function refreshSecurity(): Promise<void> {
+    if (document.visibilityState !== 'visible') return
     const [version, deviceRows] = await Promise.all([
       window.excelSync.clientVersion().catch(() => null),
       authenticated ? window.excelSync.devices().catch(() => [] as DeviceView[]) : Promise.resolve([] as DeviceView[])
@@ -1021,19 +1202,32 @@ function SettingsPage({ settings, onChange, onSave, onChooseDirectory, canManage
   useEffect(() => {
     void refreshSecurity()
     let disposed = false
+    let requestInFlight = false
     const refreshTelegramStatus = async (): Promise<void> => {
-      const next = await window.excelSync.telegramUserStatus().catch(() => null)
-      if (!next || disposed) return
-      if (next.state === 'AUTH_FAILED' && telegramStateRef.current !== 'AUTH_FAILED') {
-        onToast('Telegram 授权失败或已被撤销，可以直接重新验证，无需退出 ExcelSync。')
+      if (disposed || requestInFlight || document.visibilityState !== 'visible') return
+      requestInFlight = true
+      try {
+        const next = await window.excelSync.telegramUserStatus().catch(() => null)
+        if (!next || disposed) return
+        if (next.state === 'AUTH_FAILED' && telegramStateRef.current !== 'AUTH_FAILED') {
+          onToast('Telegram 授权失败或已被撤销，可以直接重新验证，无需退出 ExcelSync。')
+        }
+        telegramStateRef.current = next.state
+        setTelegramUserStatus(next)
+      } finally {
+        requestInFlight = false
       }
-      telegramStateRef.current = next.state
-      setTelegramUserStatus(next)
     }
     void refreshTelegramStatus()
+    const onFocus = (): void => { void refreshTelegramStatus() }
+    const onVisibilityChange = (): void => { void refreshTelegramStatus() }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     const timer = window.setInterval(() => { void refreshTelegramStatus() }, 4000)
     return () => {
       disposed = true
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       window.clearInterval(timer)
     }
   }, [authenticated])
@@ -1187,6 +1381,9 @@ export default function App(): ReactElement {
   const [page, setPage] = useState<Page>('dashboard')
   const [dashboardData, setDashboardData] = useState<DashboardView | null>(null)
   const [files, setFiles] = useState<LocalFileView[]>([])
+  const [folderPaths, setFolderPaths] = useState<string[]>([])
+  const [folderListError, setFolderListError] = useState('')
+  const [folderListLoaded, setFolderListLoaded] = useState(false)
   const [trashFiles, setTrashFiles] = useState<TrashFileView[]>([])
   const [tasks, setTasks] = useState<PendingView[]>([])
   const [problems, setProblems] = useState<ProblemView[]>([])
@@ -1194,10 +1391,12 @@ export default function App(): ReactElement {
   const [userTasks, setUserTasks] = useState<UserTask[]>([])
   const [taskDraft, setTaskDraft] = useState<TaskDraft | null>(null)
   const [globalSearch, setGlobalSearch] = useState('')
+  const [fileLocateRequest, setFileLocateRequest] = useState<{ fileId: string; sequence: number } | null>(null)
   const deferredGlobalSearch = useDeferredValue(globalSearch)
   const [notificationData, setNotificationData] = useState<NotificationListView | null>(null)
   const [notificationOpen, setNotificationOpen] = useState(false)
   const [notificationFilter, setNotificationFilter] = useState<'all' | 'unread' | 'file' | 'task' | 'system'>('all')
+  const notificationFilterRef = useRef(notificationFilter)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [advancedFilters, setAdvancedFilters] = useState<AdvancedSearchInput>({})
   const [advancedResults, setAdvancedResults] = useState<AdvancedSearchFileView[]>([])
@@ -1220,11 +1419,20 @@ export default function App(): ReactElement {
   const [busyAction, setBusyAction] = useState<ActionKey | null>(null)
   const [actionFeedback, setActionFeedback] = useState<ActionFeedback | null>(null)
   const [transferProgress, setTransferProgress] = useState<Record<string, TransferProgressView>>({})
+  const [transferFailures, setTransferFailures] = useState<TransferProgressView[]>([])
   const busyActionRef = useRef<ActionKey | null>(null)
   const transferCleanupTimersRef = useRef(new Map<string, number>())
+  const fileLocateSequenceRef = useRef(0)
   const previewRequestRef = useRef(0)
   const legacyTaskMigrationRef = useRef(false)
   const uploadStorageTouchedRef = useRef(false)
+  const authRefreshScopeRef = useRef('')
+  const cloudRefreshGenerationRef = useRef(0)
+  const cloudRefreshInFlightRef = useRef(new Map<string, Promise<void>>())
+  const cloudRefreshSucceededAtRef = useRef(new Map<string, number>())
+  const cloudRefreshFailedAtRef = useRef(new Map<string, number>())
+  const localRefreshInFlightRef = useRef<Promise<void> | null>(null)
+  const localRefreshQueuedRef = useRef(false)
 
   const memberships = auth.memberships ?? []
   const currentMembership: WorkspaceMembershipView | undefined = memberships.find((item) => item.workspaceId === auth.defaultWorkspaceId && item.status === 'ACTIVE') ?? memberships.find((item) => item.status === 'ACTIVE')
@@ -1323,6 +1531,18 @@ export default function App(): ReactElement {
 
   async function refreshAuth(): Promise<void> {
     const state = await window.excelSync.authState()
+    const scopeKey = authRefreshScopeKey(state)
+    if (authRefreshScopeRef.current !== scopeKey) {
+      authRefreshScopeRef.current = scopeKey
+      cloudRefreshGenerationRef.current += 1
+      cloudRefreshInFlightRef.current.clear()
+      cloudRefreshSucceededAtRef.current.clear()
+      cloudRefreshFailedAtRef.current.clear()
+      setActivity([])
+      setTrashFiles([])
+      setUserTasks([])
+      setNotificationData(null)
+    }
     setAuth(state)
     if (!state.authenticated) {
       setPage('dashboard')
@@ -1331,26 +1551,73 @@ export default function App(): ReactElement {
       setVersions([])
       setUserTasks([])
     }
-    void refreshAll(state.authenticated, state).catch((error) => setToast(errorMessage(error)))
+    void refreshLocalState().catch(() => undefined)
+    void refreshVisibleCloud(state, false).catch(() => undefined)
   }
 
-  async function refreshNotifications(filter = notificationFilter): Promise<void> {
-    if (!auth.authenticated) { setNotificationData(null); return }
-    try {
-      setNotificationData(await window.excelSync.notifications(filter))
-    } catch {
-      // Notifications are supplemental and must not break the main refresh loop.
-    }
+  async function refreshCloudResource<T>(key: string, load: () => Promise<T>, apply: (value: T) => void, force = false): Promise<void> {
+    if (document.visibilityState !== 'visible') return
+    const now = Date.now()
+    if (!force && now - (cloudRefreshSucceededAtRef.current.get(key) ?? 0) < CLOUD_REFRESH_INTERVAL_MS) return
+    if (!force && now - (cloudRefreshFailedAtRef.current.get(key) ?? 0) < CLOUD_REFRESH_FAILURE_COOLDOWN_MS) return
+    const existing = cloudRefreshInFlightRef.current.get(key)
+    if (existing) return existing
+
+    const generation = cloudRefreshGenerationRef.current
+    let request: Promise<void>
+    request = Promise.resolve()
+      .then(load)
+      .then((value) => {
+        if (generation !== cloudRefreshGenerationRef.current) return
+        apply(value)
+        cloudRefreshSucceededAtRef.current.set(key, Date.now())
+        cloudRefreshFailedAtRef.current.delete(key)
+      })
+      .catch(() => {
+        if (generation === cloudRefreshGenerationRef.current) cloudRefreshFailedAtRef.current.set(key, Date.now())
+        // Keep the last successful view. Cloud refresh failures must not block local file work.
+      })
+      .finally(() => {
+        if (cloudRefreshInFlightRef.current.get(key) === request) cloudRefreshInFlightRef.current.delete(key)
+      })
+    cloudRefreshInFlightRef.current.set(key, request)
+    return request
+  }
+
+  async function refreshNotifications(snapshot: AuthState = auth, filter = notificationFilter, force = false): Promise<void> {
+    if (!snapshot.authenticated || authRefreshScopeKey(snapshot) !== authRefreshScopeRef.current) return
+    await refreshCloudResource(`notifications:${filter}`, () => window.excelSync.notifications(filter), (value) => {
+      if (filter === notificationFilterRef.current) setNotificationData(value)
+    }, force)
+  }
+
+  async function refreshUserTasks(snapshot: AuthState, force = false): Promise<void> {
+    if (!snapshot.authenticated || authRefreshScopeKey(snapshot) !== authRefreshScopeRef.current) return
+    const role = snapshot.user?.systemRole
+    const membership = (snapshot.memberships ?? []).find((item) => item.workspaceId === snapshot.defaultWorkspaceId)
+    const scope = role === 'OWNER' || role === 'ADMIN' || membership?.role === 'MANAGER' ? 'all' : 'mine'
+    await refreshCloudResource('tasks', () => window.excelSync.tasks(scope, snapshot.defaultWorkspaceId ?? undefined), (rows) => {
+      setUserTasks(rows.map(cloudTaskToUserTask))
+    }, force)
+  }
+
+  async function refreshVisibleCloud(snapshot: AuthState = auth, force = false, forceNotifications = false): Promise<void> {
+    if (!snapshot.authenticated || authRefreshScopeKey(snapshot) !== authRefreshScopeRef.current || document.visibilityState !== 'visible') return
+    const requests: Promise<void>[] = [refreshNotifications(snapshot, notificationFilter, force || forceNotifications)]
+    if (page === 'activity') requests.push(refreshCloudResource('activity', () => window.excelSync.activity(), setActivity, force))
+    if (page === 'trash') requests.push(refreshCloudResource('trash', () => window.excelSync.trash(), setTrashFiles, force))
+    if (page === 'tasks') requests.push(refreshUserTasks(snapshot, force))
+    await Promise.all(requests)
   }
 
   async function markNotificationRead(notification: NotificationView): Promise<void> {
     if (!notification.read_at) await window.excelSync.markNotificationRead(notification.id)
-    await refreshNotifications()
+    await refreshNotifications(auth, notificationFilter, true)
   }
 
   async function markAllNotificationsRead(): Promise<void> {
     await window.excelSync.markAllNotificationsRead()
-    await refreshNotifications()
+    await refreshNotifications(auth, notificationFilter, true)
   }
 
   function openNotificationResource(notification: NotificationView): void {
@@ -1363,6 +1630,14 @@ export default function App(): ReactElement {
     }
     if (notification.resource_type === 'task') { setPage('tasks'); setNotificationOpen(false); return }
     setNotificationOpen(false)
+  }
+
+  function locateFileInParent(file: LocalFileView): void {
+    fileLocateSequenceRef.current += 1
+    setFileLocateRequest({ fileId: file.id, sequence: fileLocateSequenceRef.current })
+    setPage('files')
+    setGlobalSearch('')
+    setAdvancedOpen(false)
   }
 
   async function runAdvancedSearch(): Promise<void> {
@@ -1378,36 +1653,69 @@ export default function App(): ReactElement {
   }
 
   async function refreshLocalState(): Promise<void> {
-    const [dash, fileRows, taskRows, problemRows, settingRows] = await Promise.all([
-      window.excelSync.dashboard(),
-      window.excelSync.files(),
-      window.excelSync.pending(),
-      window.excelSync.problems(),
-      window.excelSync.settings()
-    ])
-    setDashboardData(dash)
-    setFiles(fileRows)
-    setTasks(taskRows)
-    setProblems(problemRows)
-    setSettings(settingRows)
-    if (!uploadStorageTouchedRef.current) setUploadStorageBackend(settingRows.defaultStorageBackend)
-    setPaused(!settingRows.autoSync)
+    if (localRefreshInFlightRef.current) {
+      localRefreshQueuedRef.current = true
+      return localRefreshInFlightRef.current
+    }
+    const work = (async () => {
+      do {
+        localRefreshQueuedRef.current = false
+        const [dash, fileRows, taskRows, problemRows, settingRows] = await Promise.all([
+          window.excelSync.dashboard(),
+          window.excelSync.files(),
+          window.excelSync.pending(),
+          window.excelSync.problems(),
+          window.excelSync.settings()
+        ])
+        setDashboardData(dash)
+        setFiles(fileRows)
+        setTasks(taskRows)
+        setProblems(problemRows)
+        setSettings(settingRows)
+        if (!uploadStorageTouchedRef.current) setUploadStorageBackend(settingRows.defaultStorageBackend)
+        setPaused(!settingRows.autoSync)
+      } while (localRefreshQueuedRef.current)
+    })()
+    localRefreshInFlightRef.current = work
+    try {
+      await work
+    } finally {
+      if (localRefreshInFlightRef.current === work) localRefreshInFlightRef.current = null
+      if (localRefreshQueuedRef.current) void refreshLocalState().catch(() => undefined)
+    }
   }
 
   async function refreshAll(includeTrash = auth.authenticated, authSnapshot: AuthState = auth): Promise<void> {
-    const [, activityRows, trashRows, userTaskRows] = await Promise.all([
-      refreshLocalState(),
-      window.excelSync.activity(),
-      includeTrash ? window.excelSync.trash() : Promise.resolve([] as TrashFileView[]),
-      authSnapshot.authenticated ? window.excelSync.tasks(
-        (authSnapshot.user?.systemRole === 'OWNER' || authSnapshot.user?.systemRole === 'ADMIN' || (authSnapshot.memberships ?? []).find((item) => item.workspaceId === authSnapshot.defaultWorkspaceId)?.role === 'MANAGER') ? 'all' : 'mine',
-        authSnapshot.defaultWorkspaceId ?? undefined
-      ) : Promise.resolve([] as UserTaskView[])
-    ])
-    setTrashFiles(trashRows)
-    setUserTasks(userTaskRows.map(cloudTaskToUserTask))
-    setActivity(activityRows)
+    if (document.visibilityState === 'visible' && authSnapshot.authenticated && authRefreshScopeKey(authSnapshot) === authRefreshScopeRef.current) {
+      const refreshes: Promise<void>[] = [
+        refreshCloudResource('activity', () => window.excelSync.activity(), setActivity, true),
+        refreshUserTasks(authSnapshot, true)
+      ]
+      if (includeTrash) refreshes.push(refreshCloudResource('trash', () => window.excelSync.trash(), setTrashFiles, true))
+      void Promise.all(refreshes)
+    }
+    await refreshLocalState()
   }
+
+  async function refreshSyncFolders(): Promise<string | null> {
+    setFolderListLoaded(false)
+    try {
+      setFolderPaths(await window.excelSync.listSyncFolders())
+      setFolderListError('')
+      return null
+    } catch (error) {
+      const message = errorMessage(error)
+      setFolderListError(message)
+      return message
+    } finally {
+      setFolderListLoaded(true)
+    }
+  }
+
+  useEffect(() => {
+    if (page !== 'files' && page !== 'favorites') return
+    void refreshSyncFolders()
+  }, [page])
 
   useEffect(() => {
     void refreshAuth().catch((error) => setToast(errorMessage(error)))
@@ -1420,6 +1728,17 @@ export default function App(): ReactElement {
     const unsubscribeTransfer = window.excelSync.onTransferProgress((progress) => {
       const existingTimer = transferCleanupTimersRef.current.get(progress.id)
       if (existingTimer) window.clearTimeout(existingTimer)
+      transferCleanupTimersRef.current.delete(progress.id)
+      if (progress.phase === 'failed') {
+        setTransferProgress((current) => {
+          const next = { ...current }
+          delete next[progress.id]
+          return next
+        })
+        setTransferFailures((current) => [progress, ...current.filter((item) => item.id !== progress.id)].slice(0, 3))
+        return
+      }
+      setTransferFailures((current) => current.filter((item) => item.id !== progress.id))
       setTransferProgress((current) => ({ ...current, [progress.id]: progress }))
       if (progress.phase === 'done') {
         const timer = window.setTimeout(() => {
@@ -1436,25 +1755,36 @@ export default function App(): ReactElement {
     const unsubscribeAuth = window.excelSync.onAuthChanged(() => {
       void refreshAuth().catch((error) => setToast(errorMessage(error)))
     })
-    const timer = window.setInterval(() => {
-      if (auth.authenticated) void refreshAll().catch(() => undefined)
-    }, 60_000)
     return () => {
       unsubscribe()
       unsubscribeTransfer()
       unsubscribeAuth()
       for (const timeout of transferCleanupTimersRef.current.values()) window.clearTimeout(timeout)
       transferCleanupTimersRef.current.clear()
-      window.clearInterval(timer)
     }
   }, [auth.authenticated])
 
   useEffect(() => {
     if (!auth.authenticated) { setNotificationData(null); return }
-    void refreshNotifications(notificationFilter)
-    const timer = window.setInterval(() => void refreshNotifications(notificationFilter), 60_000)
-    return () => window.clearInterval(timer)
-  }, [auth.authenticated, notificationFilter])
+    const filterChanged = notificationFilterRef.current !== notificationFilter
+    notificationFilterRef.current = notificationFilter
+    const refreshIfVisible = (forceNotifications = false): void => {
+      if (document.visibilityState !== 'visible') return
+      void refreshLocalState().catch(() => undefined)
+      void refreshVisibleCloud(auth, false, forceNotifications).catch(() => undefined)
+    }
+    refreshIfVisible(filterChanged)
+    const onFocus = (): void => refreshIfVisible()
+    const onVisibilityChange = (): void => refreshIfVisible()
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    const timer = window.setInterval(() => refreshIfVisible(), CLOUD_REFRESH_INTERVAL_MS)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.clearInterval(timer)
+    }
+  }, [auth.authenticated, auth.defaultWorkspaceId, auth.user?.id, page, notificationFilter, notificationOpen])
 
   useEffect(() => {
     if (!previewTarget || !auth.authenticated) {
@@ -1462,18 +1792,27 @@ export default function App(): ReactElement {
       return
     }
     let active = true
+    let requestInFlight = false
     const refreshPresence = async (): Promise<void> => {
+      if (!active || requestInFlight || document.visibilityState !== 'visible') return
+      requestInFlight = true
       try {
         const next = await window.excelSync.filePresence(previewTarget.id)
         if (active) setPreviewPresence(next)
       } catch {
         if (active) setPreviewPresence(null)
+      } finally {
+        requestInFlight = false
       }
     }
     void refreshPresence()
+    window.addEventListener('focus', refreshPresence)
+    document.addEventListener('visibilitychange', refreshPresence)
     const timer = window.setInterval(() => void refreshPresence(), 20_000)
     return () => {
       active = false
+      window.removeEventListener('focus', refreshPresence)
+      document.removeEventListener('visibilitychange', refreshPresence)
       window.clearInterval(timer)
     }
   }, [previewTarget?.id, auth.authenticated])
@@ -1538,15 +1877,15 @@ export default function App(): ReactElement {
   }
 
   async function trashSaasFile(file: LocalFileView): Promise<void> {
-    const confirmed = window.confirm(`确定要将“${file.logicalName}”移入回收站吗？`)
+    const confirmed = window.confirm(`确定将“${file.logicalName}”移入 ExcelSync 云端回收站吗？\n\n此操作隐藏 SaaS 记录，不删除本机副本，也不会物理删除 Telegram 存储对象。`)
     if (!confirmed) return
-    const taskId = startUiTask(file.logicalName, '删除')
+    const taskId = startUiTask(file.logicalName, '移入云端回收站')
     setBusyFileId(file.id)
     try {
       await window.excelSync.trashFile(file.id)
-      updateUiTask(taskId, { status: 'done', completed: 1, detail: '已移入回收站' })
+      updateUiTask(taskId, { status: 'done', completed: 1, detail: 'SaaS 记录已移入回收站；本机副本和 Telegram 存储对象保留' })
       await refreshAll(true)
-      const message = `已将 ${file.logicalName} 移入回收站。`
+      const message = `已将 ${file.logicalName} 移入云端回收站；本机副本仍保留。`
       setUndoTrash({ fileId: file.id, logicalName: file.logicalName, message })
       setToast(message)
     } catch (error) {
@@ -1607,14 +1946,14 @@ export default function App(): ReactElement {
   }
 
   async function permanentlyDeleteTrashFile(file: TrashFileView): Promise<void> {
-    if (!window.confirm(`永久删除“${file.logicalName}”？\n\n删除后它会从 SaaS 回收站消失且不能通过客户端恢复。底层历史存储对象仍按当前存储策略保留。`)) return
-    const taskId = startUiTask(file.logicalName, '永久删除')
+    if (!window.confirm(`从 ExcelSync 永久移除“${file.logicalName}”的 SaaS 记录？\n\n记录会从客户端和 SaaS 回收站消失且不能通过客户端恢复。Telegram 存储对象不会被物理删除；本机副本状态不受此操作影响。`)) return
+    const taskId = startUiTask(file.logicalName, '永久移除 SaaS 记录')
     setBusyFileId(file.id)
     try {
       await window.excelSync.permanentlyDelete(file.id)
-      updateUiTask(taskId, { status: 'done', completed: 1, detail: '已永久移出 SaaS' })
+      updateUiTask(taskId, { status: 'done', completed: 1, detail: 'SaaS 记录已移除；Telegram 存储对象保留' })
       await refreshAll(true)
-      setToast(`已从 SaaS 永久删除 ${file.logicalName}。`)
+      setToast(`已从 ExcelSync 永久移除 ${file.logicalName} 的 SaaS 记录；Telegram 存储对象保留。`)
     } catch (error) {
       updateUiTask(taskId, { status: 'error', detail: errorMessage(error) })
       setToast(errorMessage(error))
@@ -1730,11 +2069,8 @@ export default function App(): ReactElement {
     }
   }
 
-  async function moveFile(file: LocalFileView): Promise<void> {
-    const currentParent = file.relativePath.replaceAll('\\', '/').split('/').slice(0, -1).join('/')
-    const folder = window.prompt('输入目标文件夹（相对于同步根目录；留空表示根目录）：', currentParent)
-    if (folder === null) return
-    const clean = folder.trim().replace(/^\/+|\/+$/g, '')
+  async function moveFile(file: LocalFileView, destination: string): Promise<void> {
+    const clean = destination.trim().replace(/^\/+|\/+$/g, '')
     try {
       await window.excelSync.moveFile(file.id, clean ? `${clean}/${file.logicalName}` : file.logicalName)
       await refreshAll(true)
@@ -1754,25 +2090,35 @@ export default function App(): ReactElement {
     }
   }
 
-  async function copyFile(file: LocalFileView): Promise<void> {
+  async function copyFile(file: LocalFileView, targetFolder?: string): Promise<void> {
     const taskId = startUiTask(file.logicalName, '复制')
     try {
-      await window.excelSync.copyFile(file.id)
+      await window.excelSync.copyFile(file.id, targetFolder)
       updateUiTask(taskId, { status: 'done', completed: 1, detail: '复制完成，等待同步' })
       await refreshAll(true)
-      setToast(`已复制 ${file.logicalName}。`)
+      setToast(`已将 ${file.logicalName} 复制到“${targetFolder || fileParentPath(file.relativePath) || '同步根目录'}”。`)
     } catch (error) {
       updateUiTask(taskId, { status: 'error', detail: errorMessage(error) })
       setToast(errorMessage(error))
     }
   }
 
+  async function showFileInFolder(file: LocalFileView): Promise<void> {
+    try {
+      await window.excelSync.showFileInFolder(file.id)
+      setToast(`已打开 ${file.relativePath} 的所在文件夹。`)
+    } catch (error) {
+      setToast(errorMessage(error))
+    }
+  }
+
   async function createFolder(parent: string): Promise<void> {
     const name = window.prompt('新建文件夹名称：')?.trim()
-    if (!name) return
+    if (!name) { setToast('已取消新建文件夹。'); return }
     try {
       await window.excelSync.createFolder(parent, name)
-      setToast(`已新建文件夹 ${name}。`)
+      const refreshError = await refreshSyncFolders()
+      setToast(refreshError ? `已新建文件夹 ${name}，但文件夹列表刷新失败：${refreshError}` : `已新建文件夹 ${name}。`)
     } catch (error) {
       setToast(errorMessage(error))
     }
@@ -1789,8 +2135,9 @@ export default function App(): ReactElement {
       }
       updateUiTask(taskId, { status: 'done', completed: 1, detail: `已导入 ${imported.length} 个文件，等待同步` })
       await refreshAll(true)
+      const folderRefreshError = await refreshSyncFolders()
       setPage('files')
-      setToast(`已导入 ${imported.length} 个文件。`)
+      setToast(folderRefreshError ? `已导入 ${imported.length} 个文件，但文件夹列表刷新失败：${folderRefreshError}` : `已导入 ${imported.length} 个文件。`)
     } catch (error) {
       updateUiTask(taskId, { status: 'error', detail: errorMessage(error) })
       setToast(errorMessage(error))
@@ -1803,6 +2150,7 @@ export default function App(): ReactElement {
       const paths = await window.excelSync.downloadFiles(rows.map((file) => file.id))
       if (!paths) {
         updateUiTask(taskId, { status: 'done', completed: rows.length, detail: '已取消下载' })
+        setToast('已取消批量下载。')
         return
       }
       updateUiTask(taskId, { status: 'done', completed: paths.length, detail: `已下载 ${paths.length} 个文件` })
@@ -1813,10 +2161,8 @@ export default function App(): ReactElement {
     }
   }
 
-  async function bulkMove(rows: LocalFileView[]): Promise<void> {
-    const folder = window.prompt(`将 ${rows.length} 个文件移动到哪个文件夹？\n输入相对于同步根目录的路径；留空表示根目录：`, '')
-    if (folder === null) return
-    const clean = folder.trim().replace(/^\/+|\/+$/g, '')
+  async function bulkMove(rows: LocalFileView[], destination: string): Promise<void> {
+    const clean = destination.trim().replace(/^\/+|\/+$/g, '')
     const taskId = startUiTask(`${rows.length} 个文件`, '批量移动', rows.length)
     try {
       let completed = 0
@@ -1835,14 +2181,33 @@ export default function App(): ReactElement {
     }
   }
 
+  async function bulkCopy(rows: LocalFileView[], destination: string): Promise<void> {
+    const taskId = startUiTask(`${rows.length} 个文件`, '批量复制', rows.length)
+    try {
+      let completed = 0
+      for (const file of rows) {
+        await window.excelSync.copyFile(file.id, destination)
+        completed += 1
+        updateUiTask(taskId, { completed, detail: `${completed} / ${rows.length}` })
+      }
+      updateUiTask(taskId, { status: 'done', completed: rows.length, detail: '批量复制完成，等待同步' })
+      await refreshAll(true)
+      setToast(`已将 ${rows.length} 个文件复制到“${destination || '同步根目录'}”。`)
+    } catch (error) {
+      updateUiTask(taskId, { status: 'error', detail: errorMessage(error) })
+      setToast(`批量复制中断：${errorMessage(error)}`)
+      await refreshAll(true).catch(() => undefined)
+    }
+  }
+
   async function bulkTrash(rows: LocalFileView[]): Promise<void> {
     const synced = rows.filter((file) => file.currentVersion > 0)
     if (synced.length === 0) {
       setToast('所选文件尚未上传到 SaaS，不能移入云端回收站。')
       return
     }
-    if (!window.confirm(`确定将所选 ${synced.length} 个文件移入回收站吗？`)) return
-    const taskId = startUiTask(`${synced.length} 个文件`, '批量删除', synced.length)
+    if (!window.confirm(`将所选 ${synced.length} 个文件移入 ExcelSync 云端回收站？\n\n此操作隐藏 SaaS 记录，不删除本机副本，也不会物理删除 Telegram 存储对象。`)) return
+    const taskId = startUiTask(`${synced.length} 个文件`, '批量移入云端回收站', synced.length)
     try {
       let completed = 0
       for (const file of synced) {
@@ -1850,9 +2215,9 @@ export default function App(): ReactElement {
         completed += 1
         updateUiTask(taskId, { completed, detail: `${completed} / ${synced.length}` })
       }
-      updateUiTask(taskId, { status: 'done', completed: synced.length, detail: '已全部移入回收站' })
+      updateUiTask(taskId, { status: 'done', completed: synced.length, detail: 'SaaS 记录已全部移入回收站；本机副本和 Telegram 对象保留' })
       await refreshAll(true)
-      setToast(`已将 ${synced.length} 个文件移入回收站。`)
+      setToast(`已将 ${synced.length} 个文件移入云端回收站；本机副本仍保留。`)
     } catch (error) {
       updateUiTask(taskId, { status: 'error', detail: errorMessage(error) })
       setToast(`批量删除中断：${errorMessage(error)}`)
@@ -1892,6 +2257,10 @@ export default function App(): ReactElement {
   }
 
   async function cancelTask(task: PendingView): Promise<void> {
+    if (task.status === 'UPLOADING' || task.hasUploadReceipt) {
+      setToast(task.hasUploadReceipt ? '文件已上传，不能取消；请使用“重试”完成云端提交。' : '文件正在上传，当前不能取消。')
+      return
+    }
     if (!window.confirm(`取消“${task.logicalName}”的当前任务？`)) return
     try {
       await window.excelSync.cancelTask(task.id)
@@ -2107,7 +2476,7 @@ export default function App(): ReactElement {
             <button className={`advanced-search-toggle${advancedOpen ? ' active' : ''}`} onClick={() => setAdvancedOpen((value) => !value)}>筛选</button>
             {(normalizedGlobalSearch || advancedOpen) && <div className="global-search-results">
               {advancedOpen && <div className="advanced-search-panel"><div className="advanced-filter-grid"><label>类型<select value={advancedFilters.type ?? ''} onChange={(event) => setAdvancedFilters((current) => ({ ...current, type: event.target.value as AdvancedSearchInput['type'] }))}><option value="">全部</option><option>Excel</option><option>Word</option><option>PDF</option><option>CSV</option><option>ZIP</option><option>PPT</option><option>Image</option><option>EXE</option><option>Other</option></select></label><label>状态<select value={advancedFilters.state ?? ''} onChange={(event) => setAdvancedFilters((current) => ({ ...current, state: event.target.value as AdvancedSearchInput['state'] }))}><option value="">全部</option><option value="locked">已锁定</option><option value="editing">正在编辑</option><option value="trashed">回收站</option></select></label><label>路径<input value={advancedFilters.path ?? ''} onChange={(event) => setAdvancedFilters((current) => ({ ...current, path: event.target.value }))} placeholder="例如 Finance/2026" /></label><label>修改开始<input type="date" value={advancedFilters.modifiedFrom?.slice(0, 10) ?? ''} onChange={(event) => setAdvancedFilters((current) => ({ ...current, modifiedFrom: event.target.value ? new Date(`${event.target.value}T00:00:00`).toISOString() : '' }))} /></label></div><div className="advanced-filter-actions"><button className="text-button" onClick={() => { setAdvancedFilters({}); setAdvancedResults([]) }}>清除筛选</button><button className="primary" disabled={advancedBusy} onClick={() => void runAdvancedSearch()}>{advancedBusy ? '搜索中…' : '应用高级筛选'}</button></div>{advancedResults.length > 0 && <div className="global-search-section advanced-results"><span>高级筛选结果 · {advancedResults.length}</span>{advancedResults.slice(0, 30).map((row) => <button key={row.id} onClick={() => { const local = files.find((file) => file.id === row.id); if (local) void openPreview(local); else { setPage('files'); setToast('该文件当前只有云端索引，已打开文件页。') } setAdvancedOpen(false) }}><b>{row.logical_name}</b><small>{row.workspace_name} · {row.relative_path}{row.lock_owner_name ? ` · ${row.lock_owner_name} 正在编辑` : ''}</small></button>)}</div>}</div>}
-              {normalizedGlobalSearch && <><div className="global-search-section"><span>文件</span>{globalFileResults.length === 0 ? <small>没有匹配文件</small> : globalFileResults.map((file) => <button key={file.id} onClick={() => { setGlobalSearch(''); void openPreview(file) }}><b>{file.logicalName}</b><small>{file.relativePath}</small></button>)}</div><div className="global-search-section"><span>任务</span>{globalTaskResults.length === 0 ? <small>没有匹配任务</small> : globalTaskResults.map((task) => <button key={task.id} onClick={() => { setGlobalSearch(''); setPage('tasks') }}><b>{task.title}</b><small>{task.assignee || auth.username || '我'}{task.linkedResourceLabel ? ` · ${task.linkedResourceLabel}` : ''}</small></button>)}</div></>}
+              {normalizedGlobalSearch && <><div className="global-search-section"><span>文件</span>{globalFileResults.length === 0 ? <small>没有匹配文件</small> : globalFileResults.map((file) => <div className="global-search-result" key={file.id}><button className="global-search-open" onClick={() => { setGlobalSearch(''); void openPreview(file) }}><b>{file.logicalName}</b><small>{file.relativePath}</small></button><button className="global-search-locate" onClick={() => locateFileInParent(file)}>定位</button>{file.exists && <button className="global-search-locate" aria-label={`打开 ${file.relativePath} 的所在文件夹`} onClick={() => { setGlobalSearch(''); void showFileInFolder(file) }}>所在文件夹</button>}</div>)}</div><div className="global-search-section"><span>任务</span>{globalTaskResults.length === 0 ? <small>没有匹配任务</small> : globalTaskResults.map((task) => <button key={task.id} onClick={() => { setGlobalSearch(''); setPage('tasks') }}><b>{task.title}</b><small>{task.assignee || auth.username || '我'}{task.linkedResourceLabel ? ` · ${task.linkedResourceLabel}` : ''}</small></button>)}</div></>}
             </div>}
           </div>
           <div className="top-actions">
@@ -2128,11 +2497,20 @@ export default function App(): ReactElement {
           </div>
         )}
 
+        {transferFailures.length > 0 && (
+          <div className="transfer-failure-strip" role="alert" aria-live="assertive">
+            {transferFailures.map((failure) => <div className="transfer-failure-item" key={failure.id}>
+              <div><b>{failure.direction === 'upload' ? '上传失败' : '下载失败'} · {failure.fileName}</b><small>{failure.direction === 'upload' ? '请查看同步队列中的错误详情；本地文件仍保留。' : '请检查网络或目标文件夹后重试。'}</small></div>
+              <button className="icon-close" aria-label={`关闭 ${failure.fileName} 的失败提示`} onClick={() => setTransferFailures((current) => current.filter((item) => item.id !== failure.id))}>×</button>
+            </div>)}
+          </div>
+        )}
+
         {activeTransfers.length > 0 && (
           <div className="transfer-strip" role="status" aria-live="polite">
             {activeTransfers.slice(0, 3).map((progress) => {
               const percent = progress.totalBytes > 0 ? Math.min(100, Math.round((progress.transferredBytes / progress.totalBytes) * 100)) : 0
-              const phaseLabel = progress.phase === 'verifying' ? '正在校验' : progress.phase === 'transferring' ? (progress.direction === 'upload' ? '正在上传' : '正在下载') : progress.phase === 'finalizing' ? '正在提交' : '已完成'
+              const phaseLabel = progress.phase === 'verifying' ? '正在校验' : progress.phase === 'transferring' ? (progress.direction === 'upload' ? '正在上传' : '正在下载') : progress.phase === 'finalizing' ? '正在提交' : progress.phase === 'done' ? '已完成' : '传输失败'
               const speed = progress.bytesPerSecond > 0 ? `${formatBytes(progress.bytesPerSecond)}/s` : '计算中'
               return <div className="transfer-strip-item" key={progress.id}>
                 <div className="transfer-strip-head"><b>{progress.fileName}</b><span>{phaseLabel} · {percent}% · {speed}</span></div>
@@ -2154,8 +2532,8 @@ export default function App(): ReactElement {
           </section>
         )}
         {page === 'dashboard' && <Dashboard data={dashboardData} files={files} problems={problems} paused={paused} cloudEnabled={auth.authenticated && workspaceRole !== 'VIEWER'} onSync={syncNow} onPause={togglePause} onOpen={openSystemFile} onPreview={openPreview} onTasks={() => setPage('tasks')} onProblem={handleProblem} busyAction={busyAction} />}
-        {page === 'files' && <FilesPage files={files} readOnly={workspaceRole === 'VIEWER'} onOpen={openSystemFile} onPreview={openPreview} onVersions={openVersions} onRestoreLocal={restoreLocalCopy} onTrash={trashSaasFile} onDownload={downloadFile} onRename={renameFile} onMove={moveFile} onCopy={copyFile} onFavorite={toggleFileFavorite} onCreateTaskForFile={createTaskForFile} onCreateFolder={createFolder} onDropFiles={importDroppedFiles} onBulkDownload={bulkDownload} onBulkMove={bulkMove} onBulkTrash={bulkTrash} onImport={importFiles} onImportFolder={importFolder} busyAction={busyAction} busyFileId={busyFileId} />}
-        {page === 'favorites' && <FilesPage title="收藏" files={files.filter((file) => file.favorite)} readOnly={workspaceRole === 'VIEWER'} onOpen={openSystemFile} onPreview={openPreview} onVersions={openVersions} onRestoreLocal={restoreLocalCopy} onTrash={trashSaasFile} onDownload={downloadFile} onRename={renameFile} onMove={moveFile} onCopy={copyFile} onFavorite={toggleFileFavorite} onCreateTaskForFile={createTaskForFile} onCreateFolder={createFolder} onDropFiles={importDroppedFiles} onBulkDownload={bulkDownload} onBulkMove={bulkMove} onBulkTrash={bulkTrash} onImport={importFiles} onImportFolder={importFolder} busyAction={busyAction} busyFileId={busyFileId} />}
+        {page === 'files' && <FilesPage files={files} destinationFiles={files} folderPaths={folderPaths} folderListError={folderListError} folderListLoaded={folderListLoaded} onRefreshFolders={async () => { await refreshSyncFolders() }} pendingTasks={tasks} locateRequest={fileLocateRequest} onLocateFile={locateFileInParent} readOnly={workspaceRole === 'VIEWER'} onOpen={openSystemFile} onPreview={openPreview} onVersions={openVersions} onRestoreLocal={restoreLocalCopy} onTrash={trashSaasFile} onDownload={downloadFile} onRename={renameFile} onMove={moveFile} onCopy={copyFile} onBulkCopy={bulkCopy} onFavorite={toggleFileFavorite} onShowInFolder={showFileInFolder} onCreateTaskForFile={createTaskForFile} onCreateFolder={createFolder} onDropFiles={importDroppedFiles} onBulkDownload={bulkDownload} onBulkMove={bulkMove} onBulkTrash={bulkTrash} onImport={importFiles} onImportFolder={importFolder} onToast={setToast} busyAction={busyAction} busyFileId={busyFileId} />}
+        {page === 'favorites' && <FilesPage title="收藏" files={files.filter((file) => file.favorite)} destinationFiles={files} folderPaths={folderPaths} folderListError={folderListError} folderListLoaded={folderListLoaded} onRefreshFolders={async () => { await refreshSyncFolders() }} pendingTasks={tasks} locateRequest={fileLocateRequest} onLocateFile={locateFileInParent} readOnly={workspaceRole === 'VIEWER'} onOpen={openSystemFile} onPreview={openPreview} onVersions={openVersions} onRestoreLocal={restoreLocalCopy} onTrash={trashSaasFile} onDownload={downloadFile} onRename={renameFile} onMove={moveFile} onCopy={copyFile} onBulkCopy={bulkCopy} onFavorite={toggleFileFavorite} onShowInFolder={showFileInFolder} onCreateTaskForFile={createTaskForFile} onCreateFolder={createFolder} onDropFiles={importDroppedFiles} onBulkDownload={bulkDownload} onBulkMove={bulkMove} onBulkTrash={bulkTrash} onImport={importFiles} onImportFolder={importFolder} onToast={setToast} busyAction={busyAction} busyFileId={busyFileId} />}
         {page === 'trash' && <TrashPage files={trashFiles} canRestore={workspaceRole !== 'VIEWER'} canPermanentDelete={workspaceRole === 'MANAGER'} onRestore={restoreTrashFile} onPermanentDelete={permanentlyDeleteTrashFile} onBulkRestore={bulkRestoreTrash} busyFileId={busyFileId} />}
         {page === 'tasks' && <TasksPage tasks={tasks} uiTasks={uiTasks} userTasks={userTasks} currentUserName={auth.user?.displayName || auth.username || '我'} canEditFiles={workspaceRole !== 'VIEWER'} draft={taskDraft} onDraftConsumed={() => setTaskDraft(null)} onCreateUserTask={createUserTask} onUpdateUserTask={updateUserTask} onDeleteUserTask={deleteUserTask} onRunTemplate={runUserTask} onOpenLinkedFile={openSystemFile} onRetry={retryTask} onCancel={cancelTask} onResolveConflict={resolveConflict} />}
         {page === 'activity' && <div className="page-stack"><section className="panel"><div className="panel-header"><div><h2>同步记录</h2><p className="muted">这里显示最近的本地同步历史，不会记录任何密钥或密码。</p></div></div><ActivityList rows={activity} /></section>{workspaceRole !== 'VIEWER' && <RecoveryPanel workspaceId={currentMembership?.workspaceId ?? null} workspaceRole={workspaceRole} canAdmin={canAdmin} onToast={setToast} onRefresh={() => refreshAll(true)} />}</div>}

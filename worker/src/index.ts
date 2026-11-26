@@ -13,7 +13,7 @@ import {
   type AuthUser,
   type WorkspaceRole
 } from './access'
-import { HttpError, json, requestJson } from './http'
+import { HttpError, json, requestFormDataLimited, requestJson } from './http'
 import { encryptCredential } from './credential-crypto'
 import {
   activateInvite,
@@ -61,7 +61,14 @@ import {
   sha256Text,
   verifyPassword
 } from './auth'
-import { telegramGetMe, telegramGetUpdates } from './telegram-storage'
+import { TelegramUploadRejectedError, telegramGetMe, telegramGetUpdates } from './telegram-storage'
+import {
+  createBotUploadReceipt,
+  createBotUploadReceiptSigner,
+  verifyBotUploadReceiptToken,
+  type BotUploadReceipt,
+  type BotUploadReceiptClaims
+} from './bot-upload-receipt'
 import { StorageRouter } from './storage-router'
 import {
   deviceInfoSchema,
@@ -114,6 +121,7 @@ import {
 } from './collab-upgrade'
 
 const MAX_FILE_BYTES = TELEGRAM_OFFICIAL_BOT_CAPABILITIES.maxReliableFileBytes
+const MAX_MULTIPART_BYTES = MAX_FILE_BYTES + 64 * 1024
 const DEFAULT_RETENTION = 20
 const DEFAULT_ORGANIZATION_ID = '00000000-0000-4000-8000-000000000001'
 const DEFAULT_WORKSPACE_ID = '00000000-0000-4000-8000-000000000002'
@@ -275,19 +283,58 @@ const preflightSchema = z.object({
   restoredFromVersion: z.number().int().positive().nullable().optional()
 })
 
+const userGroupUploadReceiptSchema = z.object({
+  backend: z.literal('telegram_user_group'),
+  chatId: z.string().min(1).max(128),
+  messageId: z.number().int().positive(),
+  fileName: z.string().min(1).max(240),
+  size: z.number().int().positive(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+  mimeType: z.string().min(1).max(200),
+  createdAt: z.string().datetime()
+})
+
+const botUploadReceiptSchema = z.object({
+  backend: z.literal('telegram_bot'),
+  intentId: z.string().uuid(),
+  recoveryToken: z.string().min(1).max(12_000),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+  size: z.number().int().positive(),
+  fileName: z.string().min(1).max(240),
+  createdAt: z.string().datetime()
+})
+
 const uploadReceiptSchema = z.object({
   intentId: z.string().uuid(),
-  receipt: z.object({
-    backend: z.literal('telegram_user_group'),
-    chatId: z.string().min(1).max(128),
-    messageId: z.number().int().positive(),
-    fileName: z.string().min(1).max(240),
-    size: z.number().int().positive(),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/i),
-    mimeType: z.string().min(1).max(200),
-    createdAt: z.string().datetime()
-  })
+  receipt: z.discriminatedUnion('backend', [userGroupUploadReceiptSchema, botUploadReceiptSchema])
 })
+
+const botUploadClaimSchema = z.object({
+  v: z.literal(1),
+  kind: z.literal('telegram_bot_upload_claim'),
+  attemptId: z.string().uuid(),
+  createdAt: z.string().datetime()
+}).strict()
+
+function parsePersistedBotReceipt(value: string | null): BotUploadReceipt | null {
+  if (!value) return null
+  try {
+    const parsed = botUploadReceiptSchema.safeParse(JSON.parse(value))
+    return parsed.success ? parsed.data : null
+  } catch {
+    return null
+  }
+}
+
+function sameBotReceipt(left: BotUploadReceipt, right: BotUploadReceipt): boolean {
+  return left.backend === right.backend && left.intentId === right.intentId &&
+    left.recoveryToken === right.recoveryToken && left.sha256.toLowerCase() === right.sha256.toLowerCase() &&
+    left.size === right.size && left.fileName === right.fileName && left.createdAt === right.createdAt
+}
+
+function uploadOutcomeUnknown(): HttpError {
+  return new HttpError(422, 'UPLOAD_OUTCOME_UNCERTAIN', 'Telegram may have accepted this upload. Do not resend it; recover the saved receipt or contact support.')
+}
 
 const commitSchema = z.object({
   intentId: z.string().uuid()
@@ -833,7 +880,10 @@ async function handleVersions(env: RuntimeEnv, user: AuthUser, fileId: string): 
   const byVersion = new Map<number, Record<string, unknown>>()
   for (const row of result.results) byVersion.set(Number(row.version), row)
   const versions: Array<Record<string, unknown>> = []
-  for (let version = file.current_version; version >= 1; version -= 1) {
+  // Match the SQL window even when legacy metadata has large version gaps.
+  // Walking down to V1 could allocate an unbounded missing-version response.
+  const firstVersion = Math.max(1, file.current_version - 499)
+  for (let version = file.current_version; version >= firstVersion; version -= 1) {
     const row = byVersion.get(version)
     if (!row) {
       versions.push({
@@ -879,7 +929,7 @@ async function handleVersions(env: RuntimeEnv, user: AuthUser, fileId: string): 
       is_current: version === file.current_version
     })
   }
-  return json({ versions })
+  return json({ versions, hasOlderVersions: firstVersion > 1, firstVersion })
 }
 
 async function handleVersionIntegrityAudit(env: RuntimeEnv, user: AuthUser): Promise<Response> {
@@ -1225,7 +1275,7 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
   const user = auth.user
   const type = request.headers.get('content-type') ?? ''
   if (!type.includes('multipart/form-data')) throw new HttpError(415, 'MULTIPART_REQUIRED')
-  const form = await request.formData()
+  const form = await requestFormDataLimited(request, MAX_MULTIPART_BYTES)
   const intentId = String(form.get('intentId') ?? '')
   const filePart = form.get('file')
   if (!z.string().uuid().safeParse(intentId).success || !(filePart instanceof File)) {
@@ -1238,26 +1288,31 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
     .first<IntentRow>()
   if (!intent) throw new HttpError(404, 'INTENT_NOT_FOUND')
   if (intent.status === 'committed' || intent.status === 'uploaded') {
+    const receipt = parsePersistedBotReceipt(intent.upload_receipt)
     return json({
       ok: true,
       intentId,
       status: intent.status,
       telegramFileId: intent.telegram_file_id,
-      telegramMessageId: intent.telegram_message_id
+      telegramMessageId: intent.telegram_message_id,
+      ...(receipt ? { receipt, metadataPersisted: true } : {})
     })
   }
   if (intent.status !== 'reserved') throw new HttpError(409, 'INTENT_NOT_UPLOADABLE')
   if ((intent.storage_backend ?? 'telegram_bot') === 'telegram_user_group') {
     throw new HttpError(409, 'DESKTOP_STORAGE_REQUIRED', 'Telegram User Group upload must be completed by the Windows ExcelSync client')
   }
+  if (intent.upload_receipt !== null) throw uploadOutcomeUnknown()
 
   const storageConnectionId = intent.storage_connection_id ?? LEGACY_STORAGE_CONNECTION_ID
-  let storageProvider
+  let resolvedStorage
   try {
-    storageProvider = (await new StorageRouter(env).resolveConnection(storageConnectionId)).provider
+    resolvedStorage = await new StorageRouter(env).resolveConnection(storageConnectionId)
   } catch (error) {
     throw new HttpError(503, 'CLOUD_STORAGE_UNAVAILABLE', error instanceof Error ? error.message : 'CLOUD_STORAGE_UNAVAILABLE')
   }
+  if (resolvedStorage.connection.organizationId !== user.organizationId) throw new HttpError(503, 'CLOUD_STORAGE_UNAVAILABLE')
+  const storageProvider = resolvedStorage.provider
   if (filePart.size > storageProvider.capabilities.maxReliableFileBytes || intent.size > storageProvider.capabilities.maxReliableFileBytes) {
     throw new HttpError(413, 'FILE_TOO_LARGE', 'FILE_TOO_LARGE', { capabilities: storageProvider.capabilities })
   }
@@ -1273,27 +1328,132 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
   const actualHash = await sha256Hex(bytes)
   if (actualHash !== intent.hash) throw new HttpError(409, 'UPLOAD_HASH_MISMATCH')
 
-  const stored = await storageProvider.upload({
-    bytes,
-    fileName: validateLogicalName(intent.logical_name),
-    mimeType: mimeFor(intent.logical_name),
-    caption: `ExcelSync ${intent.file_id} base=${intent.base_version} hash=${intent.hash.slice(0, 12)}`
-  })
+  let signer
+  try {
+    signer = await createBotUploadReceiptSigner(env)
+  } catch {
+    throw new HttpError(503, 'BOT_UPLOAD_RECEIPT_SIGNING_KEY_UNAVAILABLE')
+  }
+
+  const claim = {
+    v: 1 as const,
+    kind: 'telegram_bot_upload_claim' as const,
+    attemptId: crypto.randomUUID(),
+    createdAt: nowIso()
+  }
+  const claimText = JSON.stringify(claim)
+  let claimed
+  try {
+    claimed = await env.DB.prepare(
+      `UPDATE upload_intents
+          SET upload_receipt = ?, updated_at = ?
+        WHERE id = ? AND owner_user_id = ? AND status = 'reserved'
+          AND (storage_backend = 'telegram_bot' OR storage_backend IS NULL) AND upload_receipt IS NULL`
+    ).bind(claimText, nowIso(), intent.id, user.id).run()
+  } catch {
+    // The claim may have committed even if D1 did not return a result. Never send after an ambiguous claim write.
+    throw uploadOutcomeUnknown()
+  }
+  if ((claimed.meta.changes ?? 0) !== 1) {
+    const latest = await env.DB.prepare('SELECT * FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1')
+      .bind(intent.id, user.id).first<IntentRow>()
+    const persistedReceipt = parsePersistedBotReceipt(latest?.upload_receipt ?? null)
+    if (latest && (latest.status === 'uploaded' || latest.status === 'committed') && persistedReceipt) {
+      return json({ ok: true, intentId, status: latest.status, receipt: persistedReceipt, metadataPersisted: true })
+    }
+    throw uploadOutcomeUnknown()
+  }
+
+  let stored
+  try {
+    stored = await storageProvider.upload({
+      bytes,
+      fileName: validateLogicalName(intent.logical_name),
+      mimeType: mimeFor(intent.logical_name),
+      caption: `ExcelSync ${intent.file_id} base=${intent.base_version} hash=${intent.hash.slice(0, 12)}`
+    })
+  } catch (error) {
+    if (error instanceof TelegramUploadRejectedError) {
+      let released
+      try {
+        released = await env.DB.prepare(
+          `UPDATE upload_intents SET upload_receipt = NULL, updated_at = ?
+            WHERE id = ? AND owner_user_id = ? AND status = 'reserved' AND upload_receipt = ?`
+        ).bind(nowIso(), intent.id, user.id, claimText).run()
+      } catch {
+        throw uploadOutcomeUnknown()
+      }
+      if ((released.meta.changes ?? 0) !== 1) throw uploadOutcomeUnknown()
+      throw new HttpError(502, 'TELEGRAM_UPLOAD_REJECTED', 'Telegram explicitly rejected the document; it is safe to retry.', {
+        telegramErrorCode: error.telegramErrorCode
+      })
+    }
+    // Fetch failures, timeouts, malformed envelopes and upstream 5xx responses may follow a successful send.
+    throw uploadOutcomeUnknown()
+  }
+
+  if (!stored.fileId || !Number.isInteger(stored.messageId) || stored.messageId <= 0) throw uploadOutcomeUnknown()
+  const createdAt = nowIso()
+  let receipt: BotUploadReceipt
+  try {
+    const claims: BotUploadReceiptClaims = {
+      v: 1,
+      kind: 'telegram_bot_upload_receipt',
+      audience: new URL(request.url).origin,
+      intentId: intent.id,
+      attemptId: claim.attemptId,
+      ownerUserId: user.id,
+      organizationId: user.organizationId,
+      fileId: intent.file_id,
+      workspaceId: intent.workspace_id,
+      storageConnectionId,
+      backend: 'telegram_bot',
+      chatId: resolvedStorage.connection.chatId,
+      botIdentity: resolvedStorage.connection.botIdentity,
+      idempotencyKey: intent.idempotency_key,
+      baseVersion: intent.base_version,
+      sha256: intent.hash.toLowerCase(),
+      size: intent.size,
+      fileName: intent.logical_name,
+      telegramFileId: stored.fileId,
+      telegramMessageId: stored.messageId,
+      telegramFileUniqueId: stored.fileUniqueId ?? null,
+      createdAt
+    }
+    receipt = await createBotUploadReceipt(signer, claims)
+  } catch {
+    throw uploadOutcomeUnknown()
+  }
 
   const updatedAt = nowIso()
-  const saved = await env.DB.prepare(
-    `UPDATE upload_intents
-        SET status = 'uploaded', telegram_file_id = ?, telegram_message_id = ?, telegram_file_unique_id = ?,
-            storage_backend = 'telegram_bot', storage_locator = ?, updated_at = ?
-      WHERE id = ? AND owner_user_id = ? AND status = 'reserved'`
-  )
-    .bind(stored.fileId, stored.messageId, stored.fileUniqueId ?? null,
-      JSON.stringify({ fileId: stored.fileId, messageId: stored.messageId }), updatedAt, intent.id, user.id)
-    .run()
-  if ((saved.meta.changes ?? 0) !== 1) {
-    throw new HttpError(503, 'UPLOAD_METADATA_PERSIST_FAILED')
+  let saved
+  try {
+    saved = await env.DB.prepare(
+      `UPDATE upload_intents
+          SET status = 'uploaded', telegram_file_id = ?, telegram_message_id = ?, telegram_file_unique_id = ?,
+              storage_backend = 'telegram_bot', storage_locator = ?, upload_receipt = ?, updated_at = ?
+        WHERE id = ? AND owner_user_id = ? AND status = 'reserved' AND upload_receipt = ?`
+    ).bind(stored.fileId, stored.messageId, stored.fileUniqueId ?? null,
+      JSON.stringify({ chatId: resolvedStorage.connection.chatId, messageId: stored.messageId }),
+      JSON.stringify(receipt), updatedAt, intent.id, user.id, claimText).run()
+  } catch {
+    return json({ ok: true, intentId, status: 'receipt_pending', receipt, metadataPersisted: false })
   }
-  return json({ ok: true, intentId, status: 'uploaded' })
+  if ((saved.meta.changes ?? 0) !== 1) {
+    let latest: IntentRow | null = null
+    try {
+      latest = await env.DB.prepare('SELECT * FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1')
+        .bind(intent.id, user.id).first<IntentRow>()
+    } catch {
+      // The caller has the signed receipt and can retry the receipt endpoint without another Telegram send.
+    }
+    const persistedReceipt = parsePersistedBotReceipt(latest?.upload_receipt ?? null)
+    if (latest && (latest.status === 'uploaded' || latest.status === 'committed') && persistedReceipt && sameBotReceipt(persistedReceipt, receipt)) {
+      return json({ ok: true, intentId, status: latest.status, receipt: persistedReceipt, metadataPersisted: true })
+    }
+    return json({ ok: true, intentId, status: 'receipt_pending', receipt, metadataPersisted: false })
+  }
+  return json({ ok: true, intentId, status: 'uploaded', receipt, metadataPersisted: true })
 }
 
 async function handleUploadReceipt(request: Request, env: RuntimeEnv, auth: RequestAuth): Promise<Response> {
@@ -1303,6 +1463,77 @@ async function handleUploadReceipt(request: Request, env: RuntimeEnv, auth: Requ
     .bind(input.intentId, user.id)
     .first<IntentRow>()
   if (!intent) throw new HttpError(404, 'INTENT_NOT_FOUND')
+  if (input.receipt.backend === 'telegram_bot') {
+    if (input.receipt.intentId !== input.intentId) throw new HttpError(403, 'INVALID_UPLOAD_RECEIPT')
+    if ((intent.storage_backend ?? 'telegram_bot') !== 'telegram_bot') throw new HttpError(409, 'STORAGE_BACKEND_MISMATCH')
+    const claims = await verifyBotUploadReceiptToken(input.receipt.recoveryToken, env, new URL(request.url).origin)
+    if (!claims ||
+        claims.intentId !== input.intentId || claims.ownerUserId !== user.id || claims.organizationId !== user.organizationId ||
+        claims.fileId !== intent.file_id || claims.workspaceId !== intent.workspace_id ||
+        claims.storageConnectionId !== (intent.storage_connection_id ?? LEGACY_STORAGE_CONNECTION_ID) ||
+        claims.backend !== 'telegram_bot' || claims.idempotencyKey !== intent.idempotency_key ||
+        claims.baseVersion !== intent.base_version || claims.sha256 !== intent.hash.toLowerCase() ||
+        claims.size !== intent.size || claims.fileName !== intent.logical_name ||
+        input.receipt.sha256.toLowerCase() !== claims.sha256 || input.receipt.size !== claims.size ||
+        input.receipt.fileName !== claims.fileName || input.receipt.createdAt !== claims.createdAt) {
+      throw new HttpError(403, 'INVALID_UPLOAD_RECEIPT')
+    }
+    let currentRoute
+    try {
+      currentRoute = await new StorageRouter(env).resolveConnection(claims.storageConnectionId)
+    } catch {
+      throw new HttpError(422, 'STORAGE_ROUTE_CHANGED', 'Reconnect the original Telegram Bot storage route before recovering this receipt.')
+    }
+    if (currentRoute.connection.organizationId !== user.organizationId ||
+        currentRoute.connection.chatId !== claims.chatId ||
+        currentRoute.connection.botIdentity !== claims.botIdentity) {
+      throw new HttpError(422, 'STORAGE_ROUTE_CHANGED', 'This receipt belongs to a different Telegram Bot or chat. Restore the original route to recover it.')
+    }
+    const file = await getOwnedFile(env, user, intent.file_id, 'EDITOR')
+    await assertFileLeaseCompatible(env, auth, intent.file_id)
+
+    if (intent.status === 'uploaded' || intent.status === 'committed') {
+      const persistedReceipt = parsePersistedBotReceipt(intent.upload_receipt)
+      if (!persistedReceipt || !sameBotReceipt(persistedReceipt, input.receipt)) throw new HttpError(403, 'INVALID_UPLOAD_RECEIPT')
+      return json({ ok: true, intentId: intent.id, status: intent.status })
+    }
+    if (intent.status !== 'reserved') throw new HttpError(409, 'INTENT_NOT_UPLOADABLE')
+    if (file.current_version !== claims.baseVersion) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
+
+    let claimRaw: unknown
+    try {
+      claimRaw = JSON.parse(intent.upload_receipt ?? '')
+    } catch {
+      throw new HttpError(403, 'INVALID_UPLOAD_RECEIPT')
+    }
+    const claim = botUploadClaimSchema.safeParse(claimRaw)
+    if (!claim.success || claim.data.attemptId !== claims.attemptId) throw new HttpError(403, 'INVALID_UPLOAD_RECEIPT')
+
+    const locator = JSON.stringify({ chatId: claims.chatId, messageId: claims.telegramMessageId })
+    let updated
+    try {
+      updated = await env.DB.prepare(
+        `UPDATE upload_intents
+            SET status = 'uploaded', telegram_file_id = ?, telegram_message_id = ?, telegram_file_unique_id = ?,
+                storage_backend = 'telegram_bot', storage_locator = ?, upload_receipt = ?, updated_at = ?
+          WHERE id = ? AND owner_user_id = ? AND status = 'reserved' AND upload_receipt = ?`
+      ).bind(claims.telegramFileId, claims.telegramMessageId, claims.telegramFileUniqueId,
+        locator, JSON.stringify(input.receipt), nowIso(), intent.id, user.id, intent.upload_receipt).run()
+    } catch {
+      throw new HttpError(503, 'UPLOAD_METADATA_PERSIST_FAILED')
+    }
+    if ((updated.meta.changes ?? 0) !== 1) {
+      const latest = await env.DB.prepare('SELECT * FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1')
+        .bind(intent.id, user.id).first<IntentRow>()
+      const persistedReceipt = parsePersistedBotReceipt(latest?.upload_receipt ?? null)
+      if (latest && (latest.status === 'uploaded' || latest.status === 'committed') && persistedReceipt && sameBotReceipt(persistedReceipt, input.receipt)) {
+        return json({ ok: true, intentId: intent.id, status: latest.status })
+      }
+      throw new HttpError(503, 'UPLOAD_METADATA_PERSIST_FAILED')
+    }
+    return json({ ok: true, intentId: intent.id, status: 'uploaded' })
+  }
+
   if ((intent.storage_backend ?? 'telegram_bot') !== 'telegram_user_group') throw new HttpError(409, 'STORAGE_BACKEND_MISMATCH')
   if (intent.status === 'committed' || intent.status === 'uploaded') return json({ ok: true, intentId: intent.id, status: intent.status })
   if (intent.status !== 'reserved') throw new HttpError(409, 'INTENT_NOT_UPLOADABLE')
@@ -1327,9 +1558,17 @@ async function commitUploadedIntent(env: RuntimeEnv, auth: RequestAuth, intent: 
   hash: string
 }> {
   const user = auth.user
-  if (intent.status === 'committed') {
+  const committedResult = async (): Promise<{ fileId: string; version: number; hash: string }> => {
     const file = await getOwnedFile(env, user, intent.file_id, 'VIEWER')
-    return { fileId: file.id, version: file.current_version, hash: file.current_hash ?? intent.hash }
+    const version = await env.DB.prepare(
+      'SELECT version, hash FROM file_versions WHERE file_id = ? AND version = ? AND hash = ? LIMIT 1'
+    ).bind(intent.file_id, intent.base_version + 1, intent.hash).first<{ version: number; hash: string }>()
+    if (!version) throw new HttpError(503, 'COMMITTED_VERSION_MISSING')
+    return { fileId: file.id, version: version.version, hash: version.hash }
+  }
+
+  if (intent.status === 'committed') {
+    return committedResult()
   }
   if (
     intent.status !== 'uploaded' ||
@@ -1343,10 +1582,23 @@ async function commitUploadedIntent(env: RuntimeEnv, auth: RequestAuth, intent: 
   await assertFileLeaseCompatible(env, auth, intent.file_id)
   if (current.current_version !== intent.base_version) {
     if (current.current_hash === intent.hash) {
-      await env.DB.prepare("UPDATE upload_intents SET status = 'abandoned', updated_at = ? WHERE id = ?")
-        .bind(nowIso(), intent.id)
-        .run()
-      return { fileId: current.id, version: current.current_version, hash: current.current_hash }
+      const concurrentIntent = await env.DB.prepare(
+        'SELECT status FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1'
+      ).bind(intent.id, user.id).first<{ status: IntentRow['status'] }>()
+      if (concurrentIntent?.status === 'committed') return committedResult()
+
+      const abandoned = await env.DB.prepare(
+        `UPDATE upload_intents SET status = 'abandoned', updated_at = ?
+          WHERE id = ? AND owner_user_id = ? AND status = 'uploaded'`
+      ).bind(nowIso(), intent.id, user.id).run()
+      if ((abandoned.meta.changes ?? 0) === 1) {
+        return { fileId: current.id, version: current.current_version, hash: current.current_hash }
+      }
+      const refreshed = await env.DB.prepare(
+        'SELECT status FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1'
+      ).bind(intent.id, user.id).first<{ status: IntentRow['status'] }>()
+      if (refreshed?.status === 'committed') return committedResult()
+      if (refreshed?.status === 'abandoned') return { fileId: current.id, version: current.current_version, hash: current.current_hash }
     }
     throw new HttpError(409, 'BASE_VERSION_CONFLICT', 'Cloud version advanced before commit', {
       currentVersion: current.current_version,
@@ -1436,6 +1688,28 @@ async function commitUploadedIntent(env: RuntimeEnv, auth: RequestAuth, intent: 
   ])
 
   if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) !== 1) {
+    const latestIntent = await env.DB.prepare(
+      'SELECT status FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1'
+    ).bind(intent.id, user.id).first<{ status: IntentRow['status'] }>()
+    if (latestIntent?.status === 'committed') return committedResult()
+
+    const latestFile = await getOwnedFile(env, user, intent.file_id, 'EDITOR')
+    if (latestFile.current_version > intent.base_version && latestFile.current_hash === intent.hash) {
+      const abandoned = await env.DB.prepare(
+        `UPDATE upload_intents SET status = 'abandoned', updated_at = ?
+          WHERE id = ? AND owner_user_id = ? AND status = 'uploaded'`
+      ).bind(nowIso(), intent.id, user.id).run()
+      if ((abandoned.meta.changes ?? 0) === 1) {
+        return { fileId: latestFile.id, version: latestFile.current_version, hash: latestFile.current_hash }
+      }
+      const refreshed = await env.DB.prepare(
+        'SELECT status FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1'
+      ).bind(intent.id, user.id).first<{ status: IntentRow['status'] }>()
+      if (refreshed?.status === 'committed') return committedResult()
+      if (refreshed?.status === 'abandoned') {
+        return { fileId: latestFile.id, version: latestFile.current_version, hash: latestFile.current_hash }
+      }
+    }
     throw new HttpError(409, 'BASE_VERSION_CONFLICT')
   }
   const domainEventId = await recordDomainEvent(env, {

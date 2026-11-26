@@ -36,10 +36,13 @@ describe('dual Telegram storage metadata', () => {
     const file = db.ensureFile({ relativePath: 'book.xlsx', logicalName: 'book.xlsx', extension: '.xlsx', hash, size: info.size, mtimeMs: info.mtimeMs })
     const defaultPending = db.queueUpsert(file, path, hash, info.size)
     expect(defaultPending?.storage_backend).toBe('telegram_user_group')
+    expect(defaultPending?.idempotency_key).toContain(':telegram_user_group')
     db.cancelPending(file.id)
 
     const botPending = db.queueUpsert(file, path, hash, info.size, 0, 'telegram_bot')
     expect(botPending?.storage_backend).toBe('telegram_bot')
+    expect(botPending?.idempotency_key).toContain(':telegram_bot')
+    expect(botPending?.idempotency_key).not.toBe(defaultPending?.idempotency_key)
     db.close()
   })
 
@@ -54,8 +57,11 @@ describe('dual Telegram storage metadata', () => {
     const file = db.ensureFile({ relativePath: 'override.xlsx', logicalName: 'override.xlsx', extension: '.xlsx', hash, size: info.size, mtimeMs: info.mtimeMs })
     const pending = db.queueUpsert(file, path, hash, info.size)!
     expect(pending.storage_backend).toBe('telegram_user_group')
+    const originalIdempotencyKey = pending.idempotency_key
     expect(db.setPendingStorageBackendForFile(file.id, 'telegram_bot')).toBe(1)
     expect(db.getPending(pending.id)?.storage_backend).toBe('telegram_bot')
+    expect(db.getPending(pending.id)?.idempotency_key).toContain(':telegram_bot')
+    expect(db.getPending(pending.id)?.idempotency_key).not.toBe(originalIdempotencyKey)
 
     db.setPendingStorageBackendForFile(file.id, 'telegram_user_group')
     db.setUploadReceipt(pending.id, {

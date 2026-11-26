@@ -41,7 +41,7 @@ Cloudflare D1       Telegram Storage
 
 你只需要：
 
-1. 安装 `ExcelSync-Setup-1.4.1-x64.exe`，或直接运行 Portable 版。
+1. 安装 `ExcelSync-Setup-1.4.2-x64.exe`，或直接运行 Portable 版。
 2. 打开 ExcelSync。
 3. 填写管理员提供的 **Worker 地址**，例如：
 
@@ -115,7 +115,7 @@ Wrangler 会返回新的 `database_id`。把这个 ID 写入你自己的 `wrangl
   "vars": {
     "RETENTION_LIMIT": "20",
     "SESSION_TTL_SECONDS": "2592000",
-    "CLIENT_LATEST_VERSION": "1.4.1",
+    "CLIENT_LATEST_VERSION": "1.4.2",
     "CLIENT_MINIMUM_VERSION": "1.3.1",
     "CLIENT_ROLLOUT_PERCENT": "100",
     "API_VERSION": "2026-08-31"
@@ -481,14 +481,14 @@ ExcelSync 通常由一个 `OWNER` 主账户管理同一套 Worker / D1，不需�
 
 # 10. Setup 与 Portable 的区别
 
-### `ExcelSync-Setup-1.4.1-x64.exe`
+### `ExcelSync-Setup-1.4.2-x64.exe`
 
 - 标准 Windows 安装程序；
 - 可选择安装目录；
 - 创建桌面/开始菜单入口；
 - 适合长期使用。
 
-### `ExcelSync-Portable-1.4.1-x64.exe`
+### `ExcelSync-Portable-1.4.2-x64.exe`
 
 - 无需安装即可运行；
 - 适合测试、临时使用或携带；
@@ -595,7 +595,7 @@ npm run package:win
 
 ### 更换 Telegram Bot 后旧文件怎么办
 
-如果只是给原 Storage 执行“更换 Token”，要确保新 Bot 能访问对应 Telegram 存储位置。如果新建了 Storage 并切换 Workspace 默认存储，则只影响后续新版本；历史版本仍依赖原 Storage，不会自动搬迁。
+同一个 Bot 重新生成 Token 可以更新原 Storage。换成另一个 Bot 时，应新建 Storage，保留旧 Storage 供历史版本读取；Telegram 的文件引用依赖原 Bot，加入同一群组并不能让新 Bot 读取旧 Bot 的所有文件引用。切换 Workspace 默认存储只影响后续新版本，不会自动搬迁历史数据。尚未提交的上传凭据遇到 Bot 或聊天路由变化会停止提交并明确报错。
 
 ### 上传任务卡住、断网或重启后没有立即完成
 
@@ -605,6 +605,12 @@ npm run package:win
 - 检查登录 Session 是否失效；
 - Bot 模式检查文件是否超过 20 MiB；
 - 不要手工删除本地 SQLite、缓存或状态目录来“重置”，否则可能破坏待恢复队列。
+
+1.4.2 的队列区分文件检查、Telegram 上传和云端版本提交。Telegram 成功后的上传凭据会先持久化到 SQLite，再恢复 D1 提交；后续编辑不会清除这份凭据。Bot 模式需要配套的新 Worker 才能覆盖 Telegram 成功但 D1 尚未保存凭据的故障窗口。
+
+如果提示“无法确认上传结果”，本地文件和任务会保留。Telegram Bot API 没有客户端指定的发送幂等键；在消息结果和凭据均丢失时，程序停止自动重发，需要核实存储结果。此状态不代表上传或同步成功，也不承诺真正断点续传。
+
+空闲且无变化时，云端拉取逐步放缓到五分钟；手动“立即同步”和本地新保存仍可及时触发处理。暂停同步或未登录时退出，也会先将已观察到的本地保存写入队列。
 
 ### 本地删除文件后为什么云端还在
 
@@ -621,10 +627,10 @@ npm run package:win
 推荐做法：
 
 1. 把本 `README.md` 放在 GitHub 仓库根目录；
-2. 在 GitHub 创建对应版本的 **Release**，例如 `v1.4.1`；
+2. 在 GitHub 创建对应版本的 **Release**，例如 `v1.4.2`；
 3. 把以下两个文件作为 Release Assets 上传：
-   - `ExcelSync-Setup-1.4.1-x64.exe`
-   - `ExcelSync-Portable-1.4.1-x64.exe`
+   - `ExcelSync-Setup-1.4.2-x64.exe`
+   - `ExcelSync-Portable-1.4.2-x64.exe`
 4. 同时上传 `SHA256SUMS.txt`，方便用户校验下载文件；
 5. 不建议把大型 EXE 直接提交到 Git 源码历史中。
 

@@ -12,6 +12,7 @@ export interface StorageConnectionInfo {
   organizationId: string
   provider: string
   name: string
+  botIdentity: string
   chatId: string
   chatTitle: string | null
   status: 'ACTIVE' | 'DEGRADED' | 'DISABLED'
@@ -31,6 +32,14 @@ type StorageConnectionRow = {
   chat_id: string | null
   chat_title: string | null
   status: 'ACTIVE' | 'DEGRADED' | 'DISABLED'
+}
+
+async function telegramBotIdentity(token: string): Promise<string> {
+  const botId = token.match(/^(\d+):/)?.[1]
+  if (botId) return `telegram-bot:${botId}`
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `telegram-token-sha256:${fingerprint}`
 }
 
 export class StorageRouter {
@@ -77,6 +86,7 @@ export class StorageRouter {
         organizationId: row.organization_id,
         provider: row.provider,
         name: row.name,
+        botIdentity: await telegramBotIdentity(token),
         chatId: row.chat_id,
         chatTitle: row.chat_title,
         status: row.status,

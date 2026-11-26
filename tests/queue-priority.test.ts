@@ -88,7 +88,7 @@ describe('Sync priority queue', () => {
     db.rebaseQueuedForFile(file.id, 1)
     const rebased = db.getPending(second.id)
     expect(rebased?.base_version).toBe(1)
-    expect(rebased?.idempotency_key).toBe(`${file.id}:1:${'2'.repeat(64)}`)
+    expect(rebased?.idempotency_key).toBe(`${file.id}:1:${'2'.repeat(64)}:${rebased?.storage_backend}`)
     db.close()
   })
 

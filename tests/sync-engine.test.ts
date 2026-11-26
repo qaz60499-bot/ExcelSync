@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,6 +24,10 @@ class FakeApi {
   uploaded = new Set<string>()
   intents = new Map<string, { baseVersion: number; hash: string }>()
   preflightCalls = 0
+  preflightGate: Promise<void> | null = null
+  releasePreflight: (() => void) | null = null
+  cancelRequestsCalls = 0
+  cancelled = false
   uploadCalls = 0
   uploadDelayMs = 0
   activeUploads = 0
@@ -32,9 +37,16 @@ class FakeApi {
   remoteVersion = 2
   remoteHash: string | null = null
   downloadCalls = 0
+  filesListCalls = 0
+  importCalls = 0
+  filesListFailures = 0
+  downloadHook: (() => Promise<void>) | null = null
+  filesListHook: (() => Promise<void>) | null = null
   deleteCalls = 0
   restoreCalls = 0
   trashCalls = 0
+  permanentDeleteCalls = 0
+  trashGate: Promise<void> | null = null
   restoreTrashCalls = 0
   cloudFiles: Array<{
     id: string
@@ -48,6 +60,8 @@ class FakeApi {
 
   async preflight(input: { fileId?: string; hash: string; baseVersion?: number }): Promise<PreflightResult> {
     this.preflightCalls += 1
+    if (this.preflightGate) await this.preflightGate
+    if (this.cancelled) throw new ApiError('REQUEST_CANCELLED', 0, true, 'simulated request cancellation')
     const fileId = input.fileId ?? crypto.randomUUID()
     if (this.preflightMode === 'conflict') {
       return { action: 'conflict', fileId, currentVersion: this.remoteVersion, currentHash: this.remoteHash }
@@ -85,13 +99,20 @@ class FakeApi {
   }
 
   async renameFile(): Promise<void> {}
+  cancelRequests(): void {
+    this.cancelRequestsCalls += 1
+    this.cancelled = true
+    this.releasePreflight?.()
+  }
   async releaseFileLease(): Promise<void> {}
   async clearFilePresence(): Promise<void> {}
   async deleteFile(): Promise<void> { this.deleteCalls += 1 }
-  async trashFile(): Promise<void> { this.trashCalls += 1 }
+  async trashFile(): Promise<void> { this.trashCalls += 1; await this.trashGate }
+  async permanentlyDelete(): Promise<void> { this.permanentDeleteCalls += 1 }
 
   async downloadCurrent(): Promise<{ bytes: Uint8Array; version: number; hash: string | null }> {
     this.downloadCalls += 1
+    await this.downloadHook?.()
     return { bytes: this.remoteBytes, version: this.remoteVersion, hash: this.remoteHash }
   }
 
@@ -127,22 +148,41 @@ class FakeApi {
     }
   }
 
-  async filesList() { return this.cloudFiles }
-  async pullTelegramImports(): Promise<{ importedCount: number }> { return { importedCount: 0 } }
+  async filesList() {
+    this.filesListCalls += 1
+    await this.filesListHook?.()
+    if (this.filesListFailures > 0) {
+      this.filesListFailures -= 1
+      throw new Error('simulated network failure')
+    }
+    return this.cloudFiles
+  }
+  async pullTelegramImports(): Promise<{ importedCount: number }> {
+    this.importCalls += 1
+    return { importedCount: 0 }
+  }
 }
 
-async function fixture(content = 'local-v1', canSyncCloud?: () => Promise<boolean>) {
+async function fixture(
+  content = 'local-v1',
+  canSyncCloud?: () => Promise<boolean>,
+  autoSync = false,
+  prepareApi?: (api: FakeApi) => void,
+  cloudAccessEnabled = true
+) {
   const root = await mkdtemp(join(tmpdir(), 'excelsync-engine-'))
   roots.push(root)
   const path = join(root, 'book.xlsx')
   await writeFile(path, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from(content)]))
   const db = new LocalDb(join(root, 'state.sqlite'))
   const api = new FakeApi()
+  prepareApi?.(api)
   const engine = new SyncEngine(db, api as unknown as WorkerApi, canSyncCloud ? { canSyncCloud } : {})
+  if (!cloudAccessEnabled) engine.setCloudAccessEnabled(false)
   await engine.start({
     syncDirectory: root,
     workerUrl: 'https://example.invalid',
-    autoSync: false,
+    autoSync,
     startWithWindows: false,
     retryBaseSeconds: 2,
     retentionLimit: 20,
@@ -358,12 +398,38 @@ describe('sync engine failure and consistency behavior', () => {
     await engine.stop(); db.close()
   })
 
-  it('respects an explicit manual pause during exit flush', async () => {
-    const { path, db, api, engine } = await fixture('paused-shutdown')
-    const { pending } = await queueCurrent(path, db)
+  it('cancels and awaits active cloud jobs before stop allows the database to close', async () => {
+    const { root, path, db, api, engine } = await fixture('shutdown-cancel-job')
+    await (engine as any).watcher.stop()
+    const { file, pending } = await queueCurrent(path, db)
+    api.preflightGate = new Promise<void>((resolve) => { api.releasePreflight = resolve })
+    engine.setPaused(false)
+    await waitUntil(() => api.preflightCalls === 1)
+
+    await engine.stop()
+    const stoppedPending = db.getPending(pending.id)
+    expect(api.cancelRequestsCalls).toBe(1)
+    expect(stoppedPending?.status).toBe('RETRY_WAIT')
+    expect(db.getFile(file.id)?.status).toBe('RETRY_WAIT')
+    db.close()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const reopened = new LocalDb(join(root, 'state.sqlite'))
+    expect(reopened.getPending(pending.id)?.status).toBe(stoppedPending?.status)
+    reopened.close()
+  })
+
+  it('persists watcher work during a paused no-session exit without making cloud requests', async () => {
+    const { path, db, api, engine } = await fixture('paused-shutdown', async () => false)
+    const { file } = await markCurrentSynced(path, db, 1)
+    await writeFile(path, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('paused-local-save')]))
+    ;(engine as unknown as { watcher: { schedule(path: string): void } }).watcher.schedule(path)
     await engine.flushBeforeExit(500)
-    expect(db.getPending(pending.id)?.status).toBe('PENDING')
+    const pending = db.listPending().find((row) => row.fileId === file.id)
+    expect(pending?.status).toBe('PENDING')
+    expect(db.getPending(pending!.id)?.hash).toBe(await sha256File(path))
     expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    expect(api.commitCalls).toBe(0)
     await engine.stop(); db.close()
   })
 
@@ -425,6 +491,342 @@ describe('sync engine failure and consistency behavior', () => {
     await engine.stop(); db.close()
   })
 
+  it('keeps a pending local conflict and its bytes when a cloud baseline has the same cached hash', async () => {
+    const { root, path, db, api, engine } = await fixture('recovered-same-hash')
+    const { file, pending, hash } = await queueCurrent(path, db)
+    const conflictBaseName = 'book (conflict recovered).xlsx'
+    const conflictPath = join(root, conflictBaseName)
+    await writeFile(conflictPath, await readFile(path))
+    db.markConflict(pending.id, `Preflight conflict: PATH_ALREADY_EXISTS; local copy=${conflictBaseName}; remote refresh required`)
+    api.cloudFiles = [{
+      id: 'cloud-book-id',
+      logical_name: 'book.xlsx',
+      relative_path: 'book.xlsx',
+      current_version: 7,
+      current_hash: hash,
+      updated_at: new Date().toISOString(),
+      status: 'active'
+    }]
+
+    ;(engine as any).paused = false
+    await engine.pullRemoteChanges(true)
+
+    expect(db.getFile(file.id)).toMatchObject({ current_version: 0, status: 'CONFLICT' })
+    expect(db.getFile('cloud-book-id')).toBeNull()
+    expect(db.getPending(pending.id)?.status).toBe('CONFLICT')
+    expect(api.downloadCalls).toBe(0)
+    expect(await sha256File(path)).toBe(hash)
+    expect(await sha256File(conflictPath)).toBe(hash)
+    await engine.stop(); db.close()
+  })
+
+  it('adopts a remote baseline only after a fresh stable hash matches and no pending work exists', async () => {
+    const { path, db, api, engine } = await fixture('fresh-baseline-adoption')
+    const hash = await sha256File(path)
+    const info = await import('node:fs/promises').then(({ stat }) => stat(path))
+    const local = db.ensureFile({ relativePath: 'book.xlsx', logicalName: 'book.xlsx', extension: '.xlsx', hash, size: info.size, mtimeMs: info.mtimeMs })
+    api.cloudFiles = [{
+      id: 'cloud-book-id', logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 7,
+      current_hash: hash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+
+    ;(engine as any).paused = false
+    await engine.pullRemoteChanges(true)
+
+    expect(db.getFile(local.id)).toBeNull()
+    expect(db.getFile('cloud-book-id')).toMatchObject({ current_version: 7, current_hash: hash, status: 'SYNCED' })
+    expect(db.listPending()).toHaveLength(0)
+    expect(api.downloadCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('holds first-start queue dispatch until a matching cloud baseline is adopted', async () => {
+    let releaseListing!: () => void
+    let markListingStarted!: () => void
+    const listingStarted = new Promise<void>((resolve) => { markListingStarted = resolve })
+    const listingGate = new Promise<void>((resolve) => { releaseListing = resolve })
+    const cloudId = 'cloud-startup-book-id'
+    const { path, db, api, engine } = await fixture('startup-baseline-adoption', undefined, true, (fakeApi) => {
+      fakeApi.filesListHook = async () => {
+        markListingStarted()
+        await listingGate
+      }
+    })
+    await listingStarted
+    await (engine as any).watcher.stop()
+
+    await engine.handleFileReady(path)
+    const local = db.getFileByPath('book.xlsx')!
+    const pending = db.db.prepare('SELECT id FROM pending_sync WHERE file_id = ?').get(local.id) as { id: string } | undefined
+    const hash = await sha256File(path)
+    expect(pending).toBeDefined()
+    api.cloudFiles = [{
+      id: cloudId, logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 7,
+      current_hash: hash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+
+    await (engine as any).processOne()
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+
+    releaseListing()
+    await engine.pullRemoteChanges(true)
+
+    expect(db.getFile(local.id)).toBeNull()
+    expect(db.getFile(cloudId)).toMatchObject({ current_version: 7, current_hash: hash, status: 'SYNCED' })
+    expect(db.getPending(pending!.id)).toBeNull()
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    expect(api.commitCalls).toBe(0)
+    expect(db.db.prepare("SELECT 1 AS found FROM sync_history WHERE event_type = 'REMOTE_PATH_CONFLICT' LIMIT 1").get()).toBeUndefined()
+    await engine.stop(); db.close()
+  })
+
+  it('adopts an already queued pristine file while excluding it from ordinary dispatch', async () => {
+    const { path, db, api, engine } = await fixture('queued-baseline-adoption')
+    const { file, pending, hash } = await queueCurrent(path, db)
+    api.cloudFiles = [{
+      id: 'cloud-queued-book-id', logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 4,
+      current_hash: hash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+    let releaseSnapshot!: () => void
+    let markSnapshotStarted!: () => void
+    const snapshotStarted = new Promise<void>((resolve) => { markSnapshotStarted = resolve })
+    const snapshotGate = new Promise<void>((resolve) => { releaseSnapshot = resolve })
+    const engineInternals = engine as any
+    const stableSnapshot = engineInternals.stableSnapshot.bind(engine)
+    engineInternals.stableSnapshot = async (targetPath: string) => {
+      if (targetPath === path) {
+        markSnapshotStarted()
+        await snapshotGate
+      }
+      return stableSnapshot(targetPath)
+    }
+    engineInternals.paused = false
+
+    const pull = engine.pullRemoteChanges(true)
+    await snapshotStarted
+    await engineInternals.processOne()
+    expect(api.preflightCalls).toBe(0)
+    expect(db.getPending(pending.id)?.status).toBe('PENDING')
+
+    releaseSnapshot()
+    await pull
+
+    expect(db.getFile(file.id)).toBeNull()
+    expect(db.getFile('cloud-queued-book-id')).toMatchObject({ current_version: 4, current_hash: hash, status: 'SYNCED' })
+    expect(db.getPending(pending.id)).toBeNull()
+    expect(db.listPending()).toHaveLength(0)
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('waits for the first baseline handoff after a signed-out startup before dispatching queued files', async () => {
+    let authenticated = false
+    const remoteId = 'cloud-signed-in-book-id'
+    const { path, db, api, engine } = await fixture('signed-out-startup', async () => authenticated, true, undefined, false)
+    const { file, pending, hash } = await queueCurrent(path, db)
+    await waitUntil(() => db.getPending(pending.id)?.status === 'PENDING')
+    expect(api.preflightCalls).toBe(0)
+    api.cloudFiles = [{
+      id: remoteId, logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 5,
+      current_hash: hash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+
+    authenticated = true
+    engine.setCloudAccessEnabled(true)
+    await waitUntil(() => db.getFile(remoteId)?.current_version === 5)
+    expect(db.getFile(file.id)).toBeNull()
+    expect(db.getPending(pending.id)).toBeNull()
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('preserves a queued edit when its fresh bytes do not match the pending baseline hash', async () => {
+    const { path, db, api, engine } = await fixture('queued-edited-baseline')
+    const { file, pending, hash: queuedHash, size: queuedSize } = await queueCurrent(path, db)
+    await (engine as any).watcher.stop()
+    const editedBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('edited-after-queue')])
+    await writeFile(path, editedBytes)
+    const freshHash = await sha256File(path)
+    api.cloudFiles = [{
+      id: 'cloud-edited-book-id', logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 3,
+      current_hash: freshHash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+    ;(engine as any).paused = false
+
+    await engine.pullRemoteChanges(true)
+
+    expect(db.getFile(file.id)).toMatchObject({ current_version: 0 })
+    expect(db.getFile('cloud-edited-book-id')).toBeNull()
+    expect(db.getPending(pending.id)).toMatchObject({ status: 'PENDING', hash: queuedHash, size: queuedSize })
+    expect(await readFile(path)).toEqual(editedBytes)
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    expect(api.downloadCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('does not adopt a baseline from a stale cached hash when the actual local bytes diverged', async () => {
+    const { path, db, api, engine } = await fixture('stale-baseline-hash')
+    const cachedHash = await sha256File(path)
+    const info = await import('node:fs/promises').then(({ stat }) => stat(path))
+    const local = db.ensureFile({ relativePath: 'book.xlsx', logicalName: 'book.xlsx', extension: '.xlsx', hash: cachedHash, size: info.size, mtimeMs: info.mtimeMs })
+    const changedBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('fresh-local-edits')])
+    await writeFile(path, changedBytes)
+    api.cloudFiles = [{
+      id: 'cloud-book-id', logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 7,
+      current_hash: cachedHash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+
+    ;(engine as any).paused = false
+    await engine.pullRemoteChanges(true)
+
+    expect(db.getFile(local.id)).toMatchObject({ current_version: 0 })
+    expect(db.getFile('cloud-book-id')).toBeNull()
+    expect(await readFile(path)).toEqual(changedBytes)
+    expect(api.downloadCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('queues a fresh edit inside the watcher debounce instead of downloading over it', async () => {
+    const { path, db, api, engine } = await fixture('remote-pull-debounce-edit')
+    const { file } = await markCurrentSynced(path, db, 1)
+    await (engine as any).watcher.stop()
+    const changedBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('edit-before-pull')])
+    await writeFile(path, changedBytes)
+    api.remoteBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('advanced-cloud')])
+    api.remoteHash = createHash('sha256').update(api.remoteBytes).digest('hex')
+    api.remoteVersion = 2
+    api.cloudFiles = [{
+      id: file.id, logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 2,
+      current_hash: api.remoteHash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+
+    ;(engine as any).paused = false
+    await engine.pullRemoteChanges(true)
+
+    const pending = db.listPending().find((row) => row.fileId === file.id)
+    expect(await readFile(path)).toEqual(changedBytes)
+    expect(db.getPending(pending!.id)?.hash).toBe(createHash('sha256').update(changedBytes).digest('hex'))
+    expect(api.downloadCalls).toBe(0)
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    expect(api.commitCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('leaves edits made during a remote download in place and queues them for conflict handling', async () => {
+    const { path, db, api, engine } = await fixture('remote-pull-download-edit')
+    const { file } = await markCurrentSynced(path, db, 1)
+    await (engine as any).watcher.stop()
+    const changedBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('edit-during-download')])
+    api.remoteBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('advanced-cloud')])
+    api.remoteHash = createHash('sha256').update(api.remoteBytes).digest('hex')
+    api.remoteVersion = 2
+    api.cloudFiles = [{
+      id: file.id, logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 2,
+      current_hash: api.remoteHash, updated_at: new Date().toISOString(), status: 'active'
+    }]
+    api.downloadHook = async () => { await writeFile(path, changedBytes) }
+
+    ;(engine as any).paused = false
+    await engine.pullRemoteChanges(true)
+
+    const pending = db.listPending().find((row) => row.fileId === file.id)
+    expect(await readFile(path)).toEqual(changedBytes)
+    expect(db.getPending(pending!.id)?.hash).toBe(createHash('sha256').update(changedBytes).digest('hex'))
+    expect(api.downloadCalls).toBe(1)
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
+    expect(api.commitCalls).toBe(0)
+    await engine.stop(); db.close()
+  })
+
+  it('backs off failed remote polling while manual sync still pulls immediately', async () => {
+    const { db, api, engine } = await fixture('remote-pull-backoff')
+    api.filesListFailures = 1
+    ;(engine as any).paused = false
+    await engine.pullRemoteChanges(true)
+    await engine.pullRemoteChanges()
+    expect(api.filesListCalls).toBe(1)
+    expect(api.importCalls).toBe(1)
+
+    await engine.syncNow()
+    expect(api.filesListCalls).toBe(3)
+    expect(api.importCalls).toBe(3)
+    await engine.stop(); db.close()
+  })
+
+  it('keeps unchanged trashed and cloud-only metadata pulls inside adaptive backoff', async () => {
+    const { path, db, api, engine } = await fixture('remote-pull-metadata-backoff')
+    const { file, hash } = await markCurrentSynced(path, db, 1)
+    const trashed = db.upsertRemoteMetadata({
+      id: file.id, relativePath: file.relative_path, logicalName: file.logical_name, extension: file.extension,
+      version: 1, hash, cloudStatus: 'trashed'
+    })
+    const missing = db.ensureFile({
+      relativePath: 'gone.xlsx', logicalName: 'gone.xlsx', extension: '.xlsx', hash: 'b'.repeat(64), size: 64, mtimeMs: 1
+    })
+    db.markMissing(missing.relative_path)
+    const trashedUpdatedAt = db.getFile(file.id)?.updated_at
+    const missingUpdatedAt = db.getFile(missing.id)?.updated_at
+    api.cloudFiles = [
+      { id: trashed.id, logical_name: 'book.xlsx', relative_path: 'book.xlsx', current_version: 1, current_hash: hash, updated_at: new Date().toISOString(), status: 'trashed' },
+      { id: missing.id, logical_name: 'gone.xlsx', relative_path: 'gone.xlsx', current_version: 1, current_hash: 'b'.repeat(64), updated_at: new Date().toISOString(), status: 'active' }
+    ]
+    ;(engine as any).paused = false
+
+    await engine.pullRemoteChanges(true)
+    await engine.pullRemoteChanges(true)
+    await engine.pullRemoteChanges()
+
+    expect(api.filesListCalls).toBe(2)
+    expect(api.downloadCalls).toBe(0)
+    expect(db.getFile(file.id)?.updated_at).toBe(trashedUpdatedAt)
+    expect(db.getFile(missing.id)?.updated_at).toBe(missingUpdatedAt)
+    expect((engine as any).remotePullUnchangedStreak).toBe(2)
+    await engine.stop(); db.close()
+  })
+
+  it('shares one in-flight remote pull among concurrent callers', async () => {
+    const { db, api, engine } = await fixture('remote-pull-single-flight')
+    let release!: () => void
+    api.filesListHook = () => new Promise<void>((resolve) => { release = resolve })
+    ;(engine as any).paused = false
+    const first = engine.pullRemoteChanges(true)
+    await waitUntil(() => api.filesListCalls === 1)
+    let secondFinished = false
+    const second = engine.pullRemoteChanges(true).then(() => { secondFinished = true })
+    await Promise.resolve()
+    expect(secondFinished).toBe(false)
+    release()
+    await Promise.all([first, second])
+    expect(api.filesListCalls).toBe(1)
+    await engine.stop(); db.close()
+  })
+
+  it('lets local uploads proceed while a remote file listing is in flight', async () => {
+    const { path, db, api, engine } = await fixture('remote-pull-local-upload')
+    const { file } = await queueCurrent(path, db)
+    let release!: () => void
+    api.filesListHook = () => new Promise<void>((resolve) => { release = resolve })
+    ;(engine as any).paused = false
+    const pull = engine.pullRemoteChanges(true)
+    await waitUntil(() => api.filesListCalls === 1)
+
+    await (engine as any).processOne()
+    await waitUntil(() => api.preflightCalls === 1)
+    release()
+    await pull
+    await waitUntil(() => db.getFile(file.id)?.status === 'SYNCED')
+    expect(api.uploadCalls).toBe(1)
+    expect(api.commitCalls).toBe(1)
+    await engine.stop(); db.close()
+  })
+
   it('reconciles files removed while the app was stopped without re-downloading or deleting cloud data', async () => {
     const { path, db, api, engine } = await fixture('offline-delete')
     const { file, hash } = await markCurrentSynced(path, db)
@@ -481,6 +883,55 @@ describe('sync engine failure and consistency behavior', () => {
     expect(api.deleteCalls).toBe(0)
     expect(db.getFile(file.id)?.cloud_status).toBe('trashed')
     expect(db.listFiles().some((row) => row.id === file.id)).toBe(false)
+    await engine.stop(); db.close()
+  })
+
+  it('blocks SaaS trash and permanent deletion when local work is queued', async () => {
+    const { path, db, api, engine } = await fixture('trash-pending-guard')
+    const { file } = await markCurrentSynced(path, db, 3)
+    await (engine as any).watcher.stop()
+    await writeFile(path, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('newer-local-save')]))
+    const { pending } = await queueCurrent(path, db)
+
+    await expect(engine.trashSaasFile(file.id)).rejects.toThrow('FILE_HAS_PENDING_SYNC')
+    expect(api.trashCalls).toBe(0)
+    expect(db.getPending(pending.id)).not.toBeNull()
+
+    db.markCloudTrashed(file.id)
+    await expect(engine.permanentlyDelete(file.id)).rejects.toThrow('FILE_HAS_PENDING_SYNC')
+    expect(api.permanentDeleteCalls).toBe(0)
+    expect(db.getPending(pending.id)).not.toBeNull()
+    await engine.stop(); db.close()
+  })
+
+  it('reserves a file during cloud trash and retains saves that arrive during the request', async () => {
+    const { path, db, api, engine } = await fixture('trash-racing-save')
+    const { file } = await markCurrentSynced(path, db, 3)
+    await (engine as any).watcher.stop()
+    let releaseTrash!: () => void
+    api.trashGate = new Promise<void>((resolve) => { releaseTrash = resolve })
+    ;(engine as any).paused = false
+
+    const trash = engine.trashSaasFile(file.id)
+    await waitUntil(() => api.trashCalls === 1)
+    const editedBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('saved-during-trash')])
+    await writeFile(path, editedBytes)
+    await engine.handleFileReady(path)
+    const queued = db.db.prepare('SELECT id FROM pending_sync WHERE file_id = ?').get(file.id) as { id: string } | undefined
+    expect(queued).toBeDefined()
+    const pending = db.getPending(queued!.id)
+    expect(pending?.status).toBe('PENDING')
+    expect(api.preflightCalls).toBe(0)
+
+    releaseTrash()
+    await trash
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(db.getFile(file.id)).toMatchObject({ status: 'PENDING', cloud_status: 'trashed' })
+    expect(db.getPending(pending!.id)?.hash).toBe(await sha256File(path))
+    expect(await readFile(path)).toEqual(editedBytes)
+    expect(db.nextReadyPending()).toBeNull()
+    expect(api.preflightCalls).toBe(0)
+    expect(api.uploadCalls).toBe(0)
     await engine.stop(); db.close()
   })
 

@@ -28,7 +28,18 @@ const oldBuildDirs = [
   'dist-dual-storage-release-installers'
 ]
 
-const desktop = join(process.env.USERPROFILE || '', 'Desktop')
+function resolveDesktop() {
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-Command', "[Environment]::GetFolderPath('Desktop')"],
+    { encoding: 'utf8' }
+  )
+  const resolved = String(result.stdout || '').trim()
+  const userProfile = process.env.USERPROFILE || process.env.HOME || ''
+  return result.status === 0 && resolved ? resolved : join(userProfile, 'Desktop')
+}
+
+const desktop = resolveDesktop()
 const shortcut = join(desktop, 'ExcelSync.lnk')
 const cleanupCmd = join(desktop, 'ExcelSync-Cleanup-Old-Versions.cmd')
 const psQuote = (value) => `'${String(value).replaceAll("'", "''")}'`

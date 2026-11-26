@@ -12,6 +12,19 @@ interface TelegramEnvelope<T> {
   error_code?: number
 }
 
+const DEFINITE_TELEGRAM_UPLOAD_REJECTIONS = new Set([400, 401, 403, 404, 413, 429])
+
+export class TelegramUploadRejectedError extends Error {
+  constructor(readonly telegramErrorCode: number) {
+    super(`TELEGRAM_SENDDOCUMENT_FAILED_${telegramErrorCode}`)
+    this.name = 'TelegramUploadRejectedError'
+  }
+}
+
+function isTelegramEnvelope<T>(value: unknown): value is TelegramEnvelope<T> {
+  return value !== null && typeof value === 'object' && typeof (value as { ok?: unknown }).ok === 'boolean'
+}
+
 interface TelegramUser {
   id: number
   is_bot: boolean
@@ -131,17 +144,37 @@ export class TelegramStorage implements StorageProvider {
     if (input.caption) form.set('caption', input.caption.slice(0, 1024))
     form.set('document', new File([copy.buffer], input.fileName, { type: input.mimeType }))
 
-    const message = await this.call<TelegramMessage>('sendDocument', {
+    const response = await fetch(this.endpoint('sendDocument'), {
       method: 'POST',
-      body: form
+      body: form,
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS)
     })
-    if (!message.document) throw new Error('TELEGRAM_DOCUMENT_MISSING')
+    let raw: unknown
+    try {
+      raw = await response.json()
+    } catch {
+      throw new Error('TELEGRAM_SENDDOCUMENT_INVALID_RESPONSE')
+    }
+    if (!isTelegramEnvelope<TelegramMessage>(raw)) throw new Error('TELEGRAM_SENDDOCUMENT_INVALID_RESPONSE')
+    const payload = raw
+    const document = payload.result?.document
+    if (!response.ok || !payload.ok || !document) {
+      const explicitCode = typeof payload.error_code === 'number' && Number.isInteger(payload.error_code)
+        ? payload.error_code
+        : null
+      const code = explicitCode ?? response.status
+      if (response.status < 500 && !payload.ok && explicitCode !== null && DEFINITE_TELEGRAM_UPLOAD_REJECTIONS.has(explicitCode)) {
+        throw new TelegramUploadRejectedError(explicitCode)
+      }
+      throw new Error(`TELEGRAM_SENDDOCUMENT_FAILED_${code}`)
+    }
+    const message = payload.result!
     return {
-      fileId: message.document.file_id,
-      fileUniqueId: message.document.file_unique_id,
-      previewFileId: message.document.thumbnail?.file_id,
+      fileId: document.file_id,
+      fileUniqueId: document.file_unique_id,
+      previewFileId: document.thumbnail?.file_id,
       messageId: message.message_id,
-      size: message.document.file_size
+      size: document.file_size
     }
   }
 

@@ -86,10 +86,10 @@ export class TelegramUserStorageConfigStore {
   }
 
   async save(config: TelegramUserStorageConfig): Promise<void> {
-    this.memory = config
     if (!safeStorage.isEncryptionAvailable()) throw new Error('WINDOWS_SECURE_STORAGE_UNAVAILABLE')
     await mkdir(this.root, { recursive: true })
     await writeFile(this.configPath, safeStorage.encryptString(JSON.stringify(config)), { mode: 0o600 })
+    this.memory = config
   }
 
   async clearAuthorization(): Promise<void> {
@@ -265,14 +265,21 @@ export class TelegramUserStorageProvider {
 
   private async call<T>(path: string, body?: unknown, affectLastError = true): Promise<T> {
     if (!this.port || !this.secret) throw new Error('TELEGRAM_BRIDGE_NOT_RUNNING')
-    const response = await fetch(`http://127.0.0.1:${this.port}${path}`, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: {
-        'x-excelsync-bridge-secret': this.secret,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' })
-      },
-      body: body === undefined ? undefined : JSON.stringify(body)
-    })
+    let response: Response
+    try {
+      response = await fetch(`http://127.0.0.1:${this.port}${path}`, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: {
+          'x-excelsync-bridge-secret': this.secret,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' })
+        },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (affectLastError) this.lastError = { code: 'TELEGRAM_BRIDGE_UNAVAILABLE', message }
+      throw new Error(`TELEGRAM_BRIDGE_UNAVAILABLE: ${message}`)
+    }
     const payload = await response.json() as BridgeEnvelope<T>
     if (!response.ok || !payload.ok || payload.result === undefined) {
       const code = payload.error?.code ?? `TELEGRAM_BRIDGE_HTTP_${response.status}`
@@ -287,16 +294,21 @@ export class TelegramUserStorageProvider {
   private async callTransfer<T>(
     path: '/upload' | '/download',
     body: Record<string, unknown>,
-    meta: { direction: 'upload' | 'download'; fileName: string; totalBytes: number }
+    meta: { direction: 'upload' | 'download'; fileName: string; totalBytes: number },
+    validate?: (result: T) => Promise<void> | void
   ): Promise<T> {
     const id = randomUUID()
     let finished = false
+    let transferredBytes = 0
     const request = this.call<T>(path, { ...body, operationId: id })
     const polling = (async (): Promise<void> => {
       while (!finished) {
         try {
           const progress = await this.call<BridgeTransferProgress>(`/progress?id=${encodeURIComponent(id)}`, undefined, false)
-          this.onTransferProgress?.({ ...progress, updatedAt: Date.now() })
+          if (!finished) {
+            transferredBytes = progress.transferredBytes
+            this.onTransferProgress?.({ ...progress, updatedAt: Date.now() })
+          }
         } catch {
           // The transfer request may start a few milliseconds before the progress record exists.
         }
@@ -305,6 +317,8 @@ export class TelegramUserStorageProvider {
     })()
     try {
       const result = await request
+      await validate?.(result)
+      finished = true
       this.onTransferProgress?.({
         id,
         direction: meta.direction,
@@ -316,10 +330,36 @@ export class TelegramUserStorageProvider {
         updatedAt: Date.now()
       })
       return result
+    } catch (error) {
+      finished = true
+      this.onTransferProgress?.({
+        id,
+        direction: meta.direction,
+        fileName: meta.fileName,
+        phase: 'failed',
+        transferredBytes,
+        totalBytes: meta.totalBytes,
+        bytesPerSecond: 0,
+        updatedAt: Date.now()
+      })
+      throw error
     } finally {
       finished = true
       await polling.catch(() => undefined)
     }
+  }
+
+  private recordTransferFailure(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    const existing = this.lastError
+    const matchesExisting = existing && (message.startsWith(existing.code) || message === existing.message)
+    const code = matchesExisting
+      ? existing.code
+      : /^([A-Z][A-Z0-9_]*)(?::|$)/.exec(message)?.[1] ?? 'TELEGRAM_TRANSFER_FAILED'
+    this.lastError = matchesExisting ? existing : { code, message }
+    this.state = code === 'TELEGRAM_AUTHORIZATION_LOST' || code.startsWith('TELEGRAM_AUTHORIZATION_')
+      ? 'AUTH_FAILED'
+      : 'ERROR'
   }
 
   async configure(apiId: number, apiHash: string, groupTitle = 'ai'): Promise<void> {
@@ -448,10 +488,10 @@ export class TelegramUserStorageProvider {
     let bridgeReachable = false
     try {
       await this.start()
-      const health = await this.call<{ authorized: boolean; chatId: string | null; chatTitle: string | null }>('/health')
+      const health = await this.call<{ authorized: boolean; chatId: string | null; chatTitle: string | null }>('/health', undefined, false)
       authorized = health.authorized
       bridgeReachable = true
-      if (authorized && config.chatId && this.state !== 'SYNCING') {
+      if (authorized && config.chatId && !['SYNCING', 'ERROR', 'AUTH_FAILED'].includes(this.state)) {
         this.state = 'CONNECTED'
       } else if (!authorized && !['WAITING_CODE', 'WAITING_2FA'].includes(this.state)) {
         if (config.sessionString) {
@@ -495,13 +535,17 @@ export class TelegramUserStorageProvider {
         path: localPath,
         chatId: config.chatId,
         expectedSha256: expectedSha256.toLowerCase()
-      }, { direction: 'upload', fileName: basename(localPath), totalBytes: info.size })
-      if (result.size !== info.size) throw new Error('UPLOAD_SIZE_MISMATCH')
-      if (result.sha256.toLowerCase() !== expectedSha256.toLowerCase()) throw new Error('UPLOAD_HASH_MISMATCH')
+      }, { direction: 'upload', fileName: basename(localPath), totalBytes: info.size }, (receipt) => {
+        if (receipt.size !== info.size) throw new Error('UPLOAD_SIZE_MISMATCH')
+        if (receipt.sha256.toLowerCase() !== expectedSha256.toLowerCase()) throw new Error('UPLOAD_HASH_MISMATCH')
+      })
       this.lastSyncAt = new Date().toISOString()
-      return result
-    } finally {
+      this.lastError = null
       this.state = 'CONNECTED'
+      return result
+    } catch (error) {
+      this.recordTransferFailure(error)
+      throw error
     }
   }
 
@@ -513,7 +557,7 @@ export class TelegramUserStorageProvider {
     await this.start()
     this.state = 'SYNCING'
     try {
-      const result = await this.callTransfer<{ path: string; size: number; sha256: string }>('/download', {
+      await this.callTransfer<{ path: string; size: number; sha256: string }>('/download', {
         chatId: locator.chatId,
         messageId: locator.messageId,
         destination
@@ -521,19 +565,23 @@ export class TelegramUserStorageProvider {
         direction: 'download',
         fileName: expected?.fileName || basename(destination),
         totalBytes: Number(expected?.size ?? 0)
+      }, async (transfer) => {
+        const info = await stat(destination)
+        if (transfer.size !== info.size || (expected?.size != null && Number(expected.size) !== info.size)) {
+          await rm(destination, { force: true }).catch(() => undefined)
+          throw new Error('DOWNLOAD_SIZE_MISMATCH')
+        }
+        if (expected?.sha256 && transfer.sha256.toLowerCase() !== expected.sha256.toLowerCase()) {
+          await rm(destination, { force: true }).catch(() => undefined)
+          throw new Error('DOWNLOAD_HASH_MISMATCH')
+        }
       })
-      const info = await stat(destination)
-      if (result.size !== info.size || (expected?.size != null && Number(expected.size) !== info.size)) {
-        await rm(destination, { force: true }).catch(() => undefined)
-        throw new Error('DOWNLOAD_SIZE_MISMATCH')
-      }
-      if (expected?.sha256 && result.sha256.toLowerCase() !== expected.sha256.toLowerCase()) {
-        await rm(destination, { force: true }).catch(() => undefined)
-        throw new Error('DOWNLOAD_HASH_MISMATCH')
-      }
       this.lastSyncAt = new Date().toISOString()
-    } finally {
+      this.lastError = null
       this.state = 'CONNECTED'
+    } catch (error) {
+      this.recordTransferFailure(error)
+      throw error
     }
   }
 

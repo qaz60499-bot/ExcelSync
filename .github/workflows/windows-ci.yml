@@ -20,6 +20,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Immutable Telegram upload snapshot
+        run: python tests/telegram_storage_bridge_support_test.py
       - name: Create report directory
         shell: powershell
         run: New-Item -ItemType Directory -Force test-artifacts/windows-ci | Out-Null
@@ -47,6 +52,10 @@ jobs:
         name: Worker dry-run
         continue-on-error: true
         run: npm run worker:deploy:dry
+      - id: localhealth
+        name: Local files remain responsive with stalled cloud
+        continue-on-error: true
+        run: node scripts/reliability-local-health.cjs
       - name: Upload CI report
         if: always()
         uses: actions/upload-artifact@v4
@@ -65,4 +74,5 @@ jobs:
           if ('${{ steps.unit.outcome }}' -ne 'success') { $failed += 'unit' }
           if ('${{ steps.build.outcome }}' -ne 'success') { $failed += 'build' }
           if ('${{ steps.worker.outcome }}' -ne 'success') { $failed += 'worker-dry-run' }
+          if ('${{ steps.localhealth.outcome }}' -ne 'success') { $failed += 'local-cloud-isolation' }
           if ($failed.Count) { throw "Windows CI gate failed: $($failed -join ', ')" }
