@@ -43,6 +43,7 @@ let engineStarted = false
 let commitRejectCount = 0
 let fetchCount = 0
 let listAllWorkspaces = false
+let networkOffline = false
 
 function reportWrite(): void {
   const snapshot = { ...report, currentStage: stage, requestCount: fetchCount, updatedAt: new Date().toISOString() }
@@ -141,6 +142,10 @@ async function main(): Promise<void> {
     const url = new URL(input)
     if (url.pathname === '/files/list' && testWorkspaceId && !listAllWorkspaces) url.searchParams.set('workspaceId', testWorkspaceId)
     let scopedInit = init
+    if (networkOffline) {
+      requests.push({ route: routeLabel(url), ms: 0, errorCode: 'INJECTED_OFFLINE' })
+      throw new TypeError('Injected offline transport')
+    }
     if (url.pathname === '/sync/preflight' && testWorkspaceId && typeof init?.body === 'string') {
       const input = JSON.parse(init.body) as Record<string, unknown>
       scopedInit = { ...init, body: JSON.stringify({ ...input, workspaceId: testWorkspaceId }) }
@@ -389,6 +394,75 @@ async function main(): Promise<void> {
     throw Object.assign(new Error('RECEIPT_RECOVERY_PARITY_FAILED'), { code: 'RECEIPT_RECOVERY_PARITY_FAILED' })
   }
 
+  stage = 'historical-version-download-sha256'
+  const history = []
+  for (const [version, expectedHash] of [[1, initialHash], [2, editedHash]] as const) {
+    const downloaded = await api.downloadVersion(fileId, version)
+    const metadata = recoveredVersions.find(row => row.version === version)
+    const actualHash = sha256(downloaded.bytes)
+    history.push({ version, bytes: downloaded.bytes.byteLength, expectedHash, downloadedHash: actualHash, d1Hash: metadata?.hash })
+    if (actualHash !== expectedHash || metadata?.hash !== actualHash) throw new Error('HISTORY_SHA256_MISMATCH')
+  }
+  report.historicalDownloads = history
+
+  stage = 'offline-save-and-sqlite-restart'
+  await engine.stop()
+  engineStarted = false
+  networkOffline = true
+  engine = new SyncEngine(localDb, api)
+  await engine.start(settings)
+  engineStarted = true
+  const offlineBook = new ExcelJS.Workbook()
+  await offlineBook.xlsx.readFile(localPath)
+  offlineBook.getWorksheet('Fixture')!.getCell('B2').value = 13
+  await offlineBook.xlsx.writeFile(localPath)
+  const offlineHash = sha256(await readFile(localPath))
+  await engine.handleFileReady(localPath, undefined, 'telegram_bot')
+  const offlinePending = await waitFor(() => {
+    const row = pendingRow(localDb!, fileId)
+    return row?.status === 'RETRY_WAIT' ? row : null
+  }, 'OFFLINE_SAVE_NOT_DURABLE')
+  await engine.stop()
+  engineStarted = false
+  localDb.close()
+  localDb = new LocalDb(dbPath)
+  const survived = pendingRow(localDb, fileId)
+  if (survived?.hash !== offlineHash) throw new Error('OFFLINE_QUEUE_LOST_ON_RESTART')
+  networkOffline = false
+  localDb.requeuePending(String(offlinePending.id))
+  engine = new SyncEngine(localDb, api)
+  await engine.start({ ...settings, autoSync: false })
+  engineStarted = true
+  engine.setPaused(false)
+  await engine.syncNow()
+  await waitFor(() => localDb?.getFile(fileId)?.current_version === 4, 'OFFLINE_RECONNECT_FAILED')
+  const offlineCloud = await api.downloadCurrent(fileId)
+  report.offlineRestart = { fault: 'injected disconnected transport', persistedHash: survived.hash,
+    downloadedHash: sha256(offlineCloud.bytes), version: offlineCloud.version, bytesPreserved: offlineHash === sha256(offlineCloud.bytes) }
+  if (offlineCloud.version !== 4 || offlineHash !== sha256(offlineCloud.bytes)) throw new Error('OFFLINE_RECONNECT_HASH_MISMATCH')
+
+  stage = 'real-large-csv-transfer'
+  const csvName = fileName.replace(/\.xlsx$/, '.csv')
+  const csvPath = join(fixtureRoot, csvName)
+  const csvBytes = Buffer.from('sequence,value\n' + '12345678,abcdefgh\n'.repeat(500_000))
+  await import('node:fs/promises').then(({ writeFile }) => writeFile(csvPath, csvBytes))
+  const csvHash = sha256(csvBytes)
+  const transferStarted = Date.now()
+  await engine.handleFileReady(csvPath, undefined, 'telegram_bot')
+  await engine.syncNow()
+  const csvFile = await waitFor(() => {
+    const row = localDb?.getFileByPath(csvName)
+    return row?.current_version === 1 && row.status === 'SYNCED' ? row : null
+  }, 'LARGE_CSV_UPLOAD_FAILED')
+  const uploadMs = Date.now() - transferStarted
+  const downloadStarted = Date.now()
+  const csvCloud = await api.downloadCurrent(csvFile.id)
+  const csvVersion = await api.versions(csvFile.id)
+  report.largeCsv = { bytes: csvBytes.byteLength, uploadMs, downloadMs: Date.now() - downloadStarted,
+    localHash: csvFile.current_hash, downloadedHash: sha256(csvCloud.bytes), d1Hash: csvVersion[0]?.hash,
+    version: csvCloud.version, shaMatches: csvHash === sha256(csvCloud.bytes) && csvVersion[0]?.hash === csvHash }
+  if (csvHash !== sha256(csvCloud.bytes) || csvVersion[0]?.hash !== csvHash) throw new Error('LARGE_CSV_HASH_MISMATCH')
+
   report.defaultWorkspacePreserved = (await api.workspaces()).defaultWorkspaceId === originalDefaultId
   if (!report.defaultWorkspacePreserved) throw Object.assign(new Error('ACCOUNT_DEFAULT_WORKSPACE_CHANGED'), { code: 'ACCOUNT_DEFAULT_WORKSPACE_CHANGED' })
   report.ok = true
@@ -411,13 +485,13 @@ async function main(): Promise<void> {
       listAllWorkspaces = true
       const remaining = await activeApi.filesList()
       listAllWorkspaces = false
-      const exactRunFiles = remaining.filter((item) => item.logical_name === fileName)
+      const exactRunFiles = remaining.filter((item) => item.logical_name.startsWith(fileName.replace(/\.xlsx$/, '.')))
       for (const file of exactRunFiles.filter((item) => item.status === 'active')) {
         await activeApi.trashFile(file.id, file.current_version)
       }
       listAllWorkspaces = true
       const globalAfter = await activeApi.filesList()
-      const activeSameRun = globalAfter.filter((file) => file.logical_name === fileName && file.status === 'active')
+      const activeSameRun = globalAfter.filter((file) => file.logical_name.startsWith(fileName.replace(/\.xlsx$/, '.')) && file.status === 'active')
       if (activeSameRun.length !== 0) throw Object.assign(new Error('ACTIVE_FIXTURE_FILES_REMAIN'), { code: 'ACTIVE_FIXTURE_FILES_REMAIN' })
       listAllWorkspaces = false
       const after = await activeApi.filesList()

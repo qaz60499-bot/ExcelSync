@@ -17,8 +17,8 @@ function redact(value) {
 
 function launch() {
   const args = process.argv.slice(2)
-  if (args.length !== 3 || args[0] !== '--readonly-parity' || args[1] !== '--file-id') {
-    throw new Error('Usage: node scripts/reliability-real-e2e.cjs --readonly-parity --file-id <UUID>')
+  if (![3, 5].includes(args.length) || args[0] !== '--readonly-parity' || args[1] !== '--file-id' || (args.length === 5 && args[3] !== '--local-db')) {
+    throw new Error('Usage: node scripts/reliability-real-e2e.cjs --readonly-parity --file-id <UUID> [--local-db <fixture SQLite>]')
   }
   const fileId = args[2]
   if (!/^[0-9a-f-]{36}$/i.test(fileId)) throw new Error('--file-id must be a UUID.')
@@ -28,7 +28,8 @@ function launch() {
   const child = spawnSync(electron, [__filename], {
     cwd: root, encoding: 'utf8', windowsHide: true, timeout: 120_000, maxBuffer: 1024 * 1024,
     env: { ...process.env, EXCELSYNC_PROJECT_ROOT: root, EXCELSYNC_REAL_E2E_ARTIFACT_ROOT: artifactRoot,
-      EXCELSYNC_REAL_E2E_REPORT: reportPath, EXCELSYNC_REAL_E2E_FILE_ID: fileId }
+      EXCELSYNC_REAL_E2E_REPORT: reportPath, EXCELSYNC_REAL_E2E_FILE_ID: fileId,
+      EXCELSYNC_REAL_E2E_LOCAL_DB: args[4] ? path.resolve(args[4]) : '' }
   })
   let report = null
   if (fs.existsSync(reportPath)) report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
@@ -55,7 +56,7 @@ async function runElectron() {
   const id = process.env.EXCELSYNC_REAL_E2E_FILE_ID || ''
   const evidence = []
   const report = { startedAt: new Date().toISOString(), mode: 'readonly-parity', transport: 'globalThis.fetch', fileId: id,
-      requestBudget: 3, requests: evidence, ok: false }
+      requestBudget: 5, requests: evidence, ok: false }
   let db = null
   let stage = 'copy-production-local-state-before-ready'
   try {
@@ -75,7 +76,7 @@ async function runElectron() {
     const auth = JSON.parse(safeStorage.decryptString(fs.readFileSync(path.join(productionHome, 'secure', 'session.bin'))))
     if (!auth.token || Date.parse(auth.expiresAt) <= Date.now()) throw Object.assign(new Error('SESSION_UNAVAILABLE_OR_EXPIRED'), { code: 'SESSION_UNAVAILABLE_OR_EXPIRED' })
     stage = 'read-local-sqlite-row'
-    db = new DatabaseSync(path.join(productionHome, 'state', 'excel-sync.sqlite'), { readOnly: true })
+    db = new DatabaseSync(process.env.EXCELSYNC_REAL_E2E_LOCAL_DB || path.join(productionHome, 'state', 'excel-sync.sqlite'), { readOnly: true })
     const setting = (key) => {
       const row = db.prepare('SELECT value_json FROM settings WHERE key = ?').get(key)
       return row?.value_json ? JSON.parse(row.value_json) : ''
@@ -93,7 +94,9 @@ async function runElectron() {
     if (!base.startsWith('https://')) throw Object.assign(new Error('WORKER_URL_UNAVAILABLE'), { code: 'WORKER_URL_UNAVAILABLE' })
     const headers = { authorization: `Bearer ${auth.token}`, 'x-excelsync-client-version': versionClient,
       'x-excelsync-api-version': '2026-08-31' }
+    let requestCount = 0
     const request = async (route, label) => {
+      if (++requestCount > 5) throw new Error('READONLY_REQUEST_BUDGET_EXCEEDED')
       const started = Date.now()
       try {
         const response = await globalThis.fetch(`${base}${route}`, { method: 'GET', headers, signal: AbortSignal.timeout(60_000) })
@@ -155,7 +158,19 @@ async function runElectron() {
       downloadedBytes: bytes.byteLength, d1ResponseVersion: d1DownloadVersion ? { version: d1DownloadVersion.version, hash: d1DownloadVersion.hash, size: d1DownloadVersion.size, status: d1DownloadVersion.status } : null }
     report.checks = checks
     report.ok = Object.values(checks).every(Boolean)
+    const historical = versions.find((row) => row.version < cloudVersion && row.status === 'active' && row.hash)
+    if (historical) {
+      stage = 'historical-download-and-sha256'
+      const response = await request(`/files/${encodedId}/versions/${historical.version}/download`, '/files/:fileId/versions/:version/download')
+      if (!response.ok) throw new Error(`HISTORY_DOWNLOAD_HTTP_${response.status}`)
+      const historicalBytes = new Uint8Array(await response.arrayBuffer())
+      const historicalHash = createHash('sha256').update(historicalBytes).digest('hex')
+      report.historical = { version: historical.version, bytes: historicalBytes.byteLength, downloadedSha256: historicalHash,
+        d1Hash: historical.hash, d1Size: historical.size, matches: historicalHash === historical.hash.toLowerCase() && historicalBytes.byteLength === historical.size }
+      report.ok = report.ok && report.historical.matches
+    }
   } catch (error) {
+    report.ok = false
     report.errorStage = stage
     report.errorCode = error.code || error.name || 'ERROR'
     report.errorMessage = redact(error.message)
