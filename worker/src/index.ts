@@ -790,7 +790,10 @@ export async function handleFilesList(request: Request, env: RuntimeEnv, user: A
   const revision = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'file_list_revision' LIMIT 1")
     .first<{ value: string }>()
   const etag = revision ? `"${await sha256Text(JSON.stringify([revision.value, user.id, user.organizationId, user.systemRole, workspaceId, includeAll, paged]))}"` : null
-  if (!cursor && etag && request.headers.get('if-none-match') === etag) {
+  // GET validators use weak comparison: edge compression can turn "tag" into W/"tag".
+  const notModified = etag && request.headers.get('if-none-match')?.split(',')
+    .some(value => value.trim().replace(/^W\//, '') === etag)
+  if (!cursor && notModified) {
     return new Response(null, { status: 304, headers: { etag, 'cache-control': 'private, no-cache', vary: 'Authorization' } })
   }
   const cursorClause = cursor ? ' AND (f.updated_at < ? OR (f.updated_at = ? AND f.id < ?))' : ''

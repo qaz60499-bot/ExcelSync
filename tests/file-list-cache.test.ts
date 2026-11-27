@@ -72,6 +72,19 @@ describe('conditional file lists with transactional invalidation', () => {
     } finally { f.sqlite.close() }
   })
 
+  it('uses weak If-None-Match comparison after edge compression rewrites the ETag', async () => {
+    const f = fixture()
+    try {
+      const etag = (await f.list()).headers.get('etag')!
+      for (const supplied of [`W/${etag}`, `"stale", W/${etag}`]) {
+        f.queries.length = 0
+        expect((await f.list('', supplied)).status).toBe(304)
+        expect(f.queries).toHaveLength(1)
+      }
+      expect((await f.list('', 'W/"stale"')).status).toBe(200)
+    } finally { f.sqlite.close() }
+  })
+
   it('invalidates workspace and direct/group ACL changes and isolates users', async () => {
     const f = fixture()
     try {
