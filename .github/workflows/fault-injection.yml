@@ -27,6 +27,8 @@ jobs:
         run: >-
           npx vitest run
           tests/api-fault-injection.test.ts
+          tests/file-list-cache.test.ts
+          tests/stream-download.test.ts
           tests/bot-client-recovery.test.ts
           tests/bot-upload-recovery.test.ts
           tests/dual-storage.test.ts

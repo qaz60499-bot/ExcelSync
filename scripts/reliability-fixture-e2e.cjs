@@ -7,7 +7,7 @@ const { spawnSync } = require('node:child_process')
 const { buildSync } = require('esbuild')
 
 const root = path.resolve(__dirname, '..')
-const artifactRoot = path.join(root, 'test-artifacts', 'reliability-20261125', 'real-e2e')
+const artifactRoot = process.env.EXCELSYNC_REAL_E2E_ARTIFACT_ROOT || path.join(root, 'test-artifacts', 'reliability-20261125', 'real-e2e')
 const reportPath = path.join(artifactRoot, 'fixture-e2e-report.json')
 const source = path.join(root, 'tests', 'fixtures', 'reliability-engine-entry.ts')
 const bundled = path.join(artifactRoot, 'reliability-engine-entry.cjs')

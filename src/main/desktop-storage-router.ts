@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import type { StorageBackend } from '../shared/storage-capabilities'
 import type { TelegramUserStorageReceipt } from '../shared/contracts'
@@ -88,50 +88,26 @@ export class DesktopStorageRouter {
   }
 
   async downloadCurrentTo(fileId: string, destination: string): Promise<{ version: number; hash: string | null; size: number; backend: StorageBackend; locator: string | null }> {
-    try {
-      const remote = await this.api.downloadCurrent(fileId)
-      const tempPath = `${destination}.excelsync-download-${randomUUID()}`
-      await mkdir(dirname(tempPath), { recursive: true })
-      await writeFile(tempPath, remote.bytes)
-      if (remote.hash) {
-        const actual = await sha256File(tempPath)
-        if (actual.toLowerCase() !== remote.hash.toLowerCase()) {
-          await rm(tempPath, { force: true })
-          throw new Error('DOWNLOAD_HASH_MISMATCH')
-        }
-      }
-      const info = await stat(tempPath)
-      await atomicReplace(tempPath, destination)
-      return { version: remote.version, hash: remote.hash, size: info.size, backend: 'telegram_bot', locator: null }
-    } catch (error) {
-      if (!(error instanceof ApiError)) throw error
-      const reference = referenceFromApiError(error)
-      if (!reference) throw error
-      return this.downloadUserReferenceTo(reference, destination)
-    }
+    return this.downloadTo(fileId, destination)
   }
 
   async downloadVersionTo(fileId: string, version: number, destination: string): Promise<{ version: number; hash: string | null; size: number; backend: StorageBackend; locator: string | null }> {
+    return this.downloadTo(fileId, destination, version)
+  }
+
+  private async downloadTo(fileId: string, destination: string, version?: number): Promise<{ version: number; hash: string | null; size: number; backend: StorageBackend; locator: string | null }> {
+    const tempPath = `${destination}.excelsync-download-${randomUUID()}`
     try {
-      const remote = await this.api.downloadVersion(fileId, version)
-      const tempPath = `${destination}.excelsync-download-${randomUUID()}`
       await mkdir(dirname(tempPath), { recursive: true })
-      await writeFile(tempPath, remote.bytes)
-      if (remote.hash) {
-        const actual = await sha256File(tempPath)
-        if (actual.toLowerCase() !== remote.hash.toLowerCase()) {
-          await rm(tempPath, { force: true })
-          throw new Error('DOWNLOAD_HASH_MISMATCH')
-        }
-      }
-      const info = await stat(tempPath)
+      const remote = await this.api.downloadTo(fileId, tempPath, version)
       await atomicReplace(tempPath, destination)
-      return { version: remote.version, hash: remote.hash, size: info.size, backend: 'telegram_bot', locator: null }
+      return { ...remote, backend: 'telegram_bot', locator: null }
     } catch (error) {
+      await rm(tempPath, { force: true }).catch(() => undefined)
       if (!(error instanceof ApiError)) throw error
       const reference = referenceFromApiError(error)
       if (!reference) throw error
-      return this.downloadUserReferenceTo({ ...reference, version: reference.version || version }, destination)
+      return this.downloadUserReferenceTo({ ...reference, version: reference.version || version || 0 }, destination)
     }
   }
 

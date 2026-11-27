@@ -746,19 +746,18 @@ async function handleLogout(env: RuntimeEnv, auth: RequestAuth): Promise<Respons
 }
 
 async function handleHealth(env: RuntimeEnv): Promise<Response> {
-  const [db, users, setup, storage] = await Promise.all([
-    env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>(),
-    env.DB.prepare('SELECT COUNT(*) AS count FROM users').first<{ count: number }>(),
-    env.DB.prepare("SELECT value FROM app_settings WHERE key = 'setup_nonce_hash' LIMIT 1").first<{ value: string }>(),
-    env.DB.prepare("SELECT chat_id FROM storage_config WHERE provider = 'telegram'").first<{ chat_id: string | null }>()
-  ])
+  const state = await env.DB.prepare(`SELECT 1 AS ok,
+    EXISTS(SELECT 1 FROM users LIMIT 1) AS has_users,
+    (SELECT value FROM app_settings WHERE key = 'setup_nonce_hash' LIMIT 1) AS setup_nonce,
+    (SELECT chat_id FROM storage_config WHERE provider = 'telegram' LIMIT 1) AS chat_id`
+  ).first<{ ok: number; has_users: number; setup_nonce: string | null; chat_id: string | null }>()
   const tokenConfigured = Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_BOT_TOKEN !== 'UNCONFIGURED')
-  const chatConfigured = Boolean(storage?.chat_id)
+  const chatConfigured = Boolean(state?.chat_id)
   return json({
-    ok: db?.ok === 1,
+    ok: state?.ok === 1,
     worker: 'ok',
-    database: db?.ok === 1 ? 'ok' : 'error',
-    setupAvailable: (users?.count ?? 0) === 0 && Boolean(setup?.value),
+    database: state?.ok === 1 ? 'ok' : 'error',
+    setupAvailable: state?.has_users === 0 && Boolean(state?.setup_nonce),
     telegram: {
       tokenConfigured,
       chatConfigured,
@@ -768,21 +767,42 @@ async function handleHealth(env: RuntimeEnv): Promise<Response> {
   })
 }
 
-async function handleFilesList(request: Request, env: RuntimeEnv, user: AuthUser): Promise<Response> {
+export async function handleFilesList(request: Request, env: RuntimeEnv, user: AuthUser): Promise<Response> {
   const url = new URL(request.url)
   const includeAll = url.searchParams.get('include') === 'all'
   const workspaceId = url.searchParams.get('workspaceId')
   if (workspaceId && !(await getEffectiveWorkspaceRole(env, user, workspaceId))) throw new HttpError(403, 'WORKSPACE_FORBIDDEN')
   const statusClause = includeAll ? "f.status IN ('active','trashed','deleted')" : "f.status = 'active'"
   const admin = isSystemAdmin(user)
+  const paged = url.searchParams.get('paged') === '1'
+  const cursorRaw = url.searchParams.get('cursor')
+  let cursor: { updatedAt: string; id: string } | null = null
+  if (cursorRaw) {
+    try {
+      const parsed = JSON.parse(cursorRaw) as Record<string, unknown>
+      if (!paged || typeof parsed.updatedAt !== 'string' || parsed.updatedAt.length > 40 ||
+          typeof parsed.id !== 'string' || parsed.id.length > 64) throw new Error('invalid cursor')
+      cursor = { updatedAt: parsed.updatedAt, id: parsed.id }
+    } catch { throw new HttpError(400, 'INVALID_FILE_LIST_CURSOR') }
+  }
+  // Read on every request, after authentication. SQL triggers invalidate atomically
+  // for metadata, membership, group and resource ACL changes, including equal timestamps.
+  const revision = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'file_list_revision' LIMIT 1")
+    .first<{ value: string }>()
+  const etag = revision ? `"${await sha256Text(JSON.stringify([revision.value, user.id, user.organizationId, user.systemRole, workspaceId, includeAll, paged]))}"` : null
+  if (!cursor && etag && request.headers.get('if-none-match') === etag) {
+    return new Response(null, { status: 304, headers: { etag, 'cache-control': 'private, no-cache', vary: 'Authorization' } })
+  }
+  const cursorClause = cursor ? ' AND (f.updated_at < ? OR (f.updated_at = ? AND f.id < ?))' : ''
+  const ordering = `ORDER BY f.updated_at DESC, f.id DESC LIMIT ${paged ? 1001 : 1000}`
   const result = await env.DB.prepare(
     admin
       ? `SELECT f.id, f.workspace_id, f.logical_name, f.relative_path, f.current_version, f.current_hash,
                 f.current_storage_backend, f.current_storage_locator, f.updated_at, f.status
            FROM files f
            JOIN workspaces w ON w.id = f.workspace_id AND w.organization_id = ?
-          WHERE (? IS NULL OR f.workspace_id = ?) AND ${statusClause}
-          ORDER BY f.updated_at DESC LIMIT 1000`
+          WHERE (? IS NULL OR f.workspace_id = ?) AND ${statusClause}${cursorClause}
+          ${ordering}`
       : `SELECT f.id, f.workspace_id, f.logical_name, f.relative_path, f.current_version, f.current_hash,
                 f.current_storage_backend, f.current_storage_locator, f.updated_at, f.status
            FROM files f
@@ -808,11 +828,17 @@ async function handleFilesList(request: Request, env: RuntimeEnv, user: AuthUser
                    OR (r.scope_type = 'FOLDER' AND (f.relative_path = r.scope_value OR f.relative_path LIKE r.scope_value || '/%'))
                  )
             )
-          ORDER BY f.updated_at DESC LIMIT 1000`
+          ${cursorClause} ${ordering}`
   ).bind(...(admin
     ? [user.organizationId, workspaceId, workspaceId]
-    : [user.id, user.organizationId, workspaceId, workspaceId, user.organizationId, user.id, user.id, user.organizationId])).all()
-  return json({ files: result.results })
+    : [user.id, user.organizationId, workspaceId, workspaceId, user.organizationId, user.id, user.id, user.organizationId]),
+    ...(cursor ? [cursor.updatedAt, cursor.updatedAt, cursor.id] : [])).all<{ id: string; updated_at: string }>()
+  const files = result.results.slice(0, 1000)
+  const last = files.at(-1)
+  const response = json({ files, ...(paged ? { nextCursor: result.results.length > 1000 && last ? JSON.stringify({ updatedAt: last.updated_at, id: last.id }) : null } : {}) })
+  if (etag) response.headers.set('etag', etag)
+  response.headers.set('vary', 'Authorization')
+  return response
 }
 
 export async function handleTrashList(env: RuntimeEnv, user: AuthUser): Promise<Response> {
@@ -1272,6 +1298,14 @@ async function handlePreflight(request: Request, env: RuntimeEnv, auth: RequestA
 }
 
 async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth): Promise<Response> {
+  const started = performance.now()
+  let telegramMs = 0
+  let hashMs = 0
+  const uploadResponse = (data: unknown): Response => {
+    const response = json(data)
+    response.headers.set('server-timing', `upload;dur=${(performance.now() - started).toFixed(1)}, telegram_upload;dur=${telegramMs.toFixed(1)}, hash;dur=${hashMs.toFixed(1)}`)
+    return response
+  }
   const user = auth.user
   const type = request.headers.get('content-type') ?? ''
   if (!type.includes('multipart/form-data')) throw new HttpError(415, 'MULTIPART_REQUIRED')
@@ -1325,7 +1359,9 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
   if (!matchesExpectedFileSignature(intent.logical_name, bytes.subarray(0, Math.min(bytes.byteLength, 4096)))) {
     throw new HttpError(415, 'FILE_SIGNATURE_MISMATCH')
   }
+  const hashStarted = performance.now()
   const actualHash = await sha256Hex(bytes)
+  hashMs = performance.now() - hashStarted
   if (actualHash !== intent.hash) throw new HttpError(409, 'UPLOAD_HASH_MISMATCH')
 
   let signer
@@ -1365,6 +1401,7 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
   }
 
   let stored
+  const telegramStarted = performance.now()
   try {
     stored = await storageProvider.upload({
       bytes,
@@ -1393,6 +1430,7 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
   }
 
   if (!stored.fileId || !Number.isInteger(stored.messageId) || stored.messageId <= 0) throw uploadOutcomeUnknown()
+  telegramMs = performance.now() - telegramStarted
   const createdAt = nowIso()
   let receipt: BotUploadReceipt
   try {
@@ -1437,7 +1475,7 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
       JSON.stringify({ chatId: resolvedStorage.connection.chatId, messageId: stored.messageId }),
       JSON.stringify(receipt), updatedAt, intent.id, user.id, claimText).run()
   } catch {
-    return json({ ok: true, intentId, status: 'receipt_pending', receipt, metadataPersisted: false })
+    return uploadResponse({ ok: true, intentId, status: 'receipt_pending', receipt, metadataPersisted: false })
   }
   if ((saved.meta.changes ?? 0) !== 1) {
     let latest: IntentRow | null = null
@@ -1451,9 +1489,9 @@ async function handleUpload(request: Request, env: RuntimeEnv, auth: RequestAuth
     if (latest && (latest.status === 'uploaded' || latest.status === 'committed') && persistedReceipt && sameBotReceipt(persistedReceipt, receipt)) {
       return json({ ok: true, intentId, status: latest.status, receipt: persistedReceipt, metadataPersisted: true })
     }
-    return json({ ok: true, intentId, status: 'receipt_pending', receipt, metadataPersisted: false })
+    return uploadResponse({ ok: true, intentId, status: 'receipt_pending', receipt, metadataPersisted: false })
   }
-  return json({ ok: true, intentId, status: 'uploaded', receipt, metadataPersisted: true })
+  return uploadResponse({ ok: true, intentId, status: 'uploaded', receipt, metadataPersisted: true })
 }
 
 async function handleUploadReceipt(request: Request, env: RuntimeEnv, auth: RequestAuth): Promise<Response> {
@@ -1933,6 +1971,8 @@ async function handleDownload(env: RuntimeEnv, user: AuthUser, fileId: string): 
         'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.logical_name)}`,
         'cache-control': 'no-store',
         'x-excelsync-version': String(file.current_version),
+        'server-timing': response.headers.get('server-timing') ?? '',
+        ...(version?.size != null ? { 'x-excelsync-size': String(version.size) } : {}),
         'x-excelsync-hash': file.current_hash ?? ''
       }
     })
@@ -1980,6 +2020,7 @@ async function handleVersionDownload(
         'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(`V${versionNumber}-${file.logical_name}`)}`,
         'cache-control': 'no-store',
         'x-excelsync-version': String(versionNumber),
+        'server-timing': response.headers.get('server-timing') ?? '',
         'x-excelsync-hash': version.hash,
         'x-excelsync-size': String(version.size),
         'x-excelsync-storage': version.storage_name
@@ -2570,8 +2611,11 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 }
 
 export async function appFetch(request: Request, env: RuntimeEnv): Promise<Response> {
+  const started = performance.now()
   try {
-    return await route(request, env)
+    const response = await route(request, env)
+    response.headers.append('server-timing', `worker;dur=${(performance.now() - started).toFixed(1)}`)
+    return response
   } catch (error) {
     if (error instanceof HttpError) {
       return json({ error: { code: error.code, message: error.message, detail: error.detail } }, error.status)

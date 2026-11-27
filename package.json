@@ -1,6 +1,6 @@
 {
   "name": "excel-sync",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "private": true,
   "description": "Windows multi-user file workspace backed by Cloudflare D1 and pluggable storage",
   "main": "out/main/index.js",

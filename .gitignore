@@ -9,6 +9,7 @@ mobile/ios/
 mobile/.vite/
 coverage/
 test-artifacts/
+audit/
 ci-dist/
 __pycache__/
 *.pyc

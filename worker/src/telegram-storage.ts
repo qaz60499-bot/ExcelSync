@@ -242,17 +242,21 @@ export class TelegramStorage implements StorageProvider {
   }
 
   async download(fileId: string): Promise<Response> {
+    const started = performance.now()
     const file = await this.call<TelegramFile>('getFile', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ file_id: fileId })
     })
     if (!file.file_path) throw new Error('TELEGRAM_FILE_PATH_MISSING')
+    const resolvedAt = performance.now()
     const response = await fetch(`${TELEGRAM_API}/file/bot${this.token}/${file.file_path}`, {
       signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS)
     })
     if (!response.ok || !response.body) throw new Error(`TELEGRAM_DOWNLOAD_FAILED_${response.status}`)
-    return response
+    const headers = new Headers(response.headers)
+    headers.set('server-timing', `telegram_resolve;dur=${(resolvedAt - started).toFixed(1)}, telegram_headers;dur=${(performance.now() - resolvedAt).toFixed(1)}`)
+    return new Response(response.body, { status: response.status, headers })
   }
 }
 

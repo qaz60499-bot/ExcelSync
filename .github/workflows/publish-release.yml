@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag to publish
         required: true
-        default: v1.4.1
+        default: v1.4.3
 
 permissions:
   contents: write
@@ -55,5 +55,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          gh release upload $env:RELEASE_TAG ci-dist/ExcelSync-Setup-1.4.1-x64.exe ci-dist/ExcelSync-Portable-1.4.1-x64.exe ci-dist/SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --clobber
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -ne "v$version") { throw 'RELEASE_TAG_VERSION_MISMATCH' }
+          gh release upload $env:RELEASE_TAG "ci-dist/ExcelSync-Setup-$version-x64.exe" "ci-dist/ExcelSync-Portable-$version-x64.exe" ci-dist/SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --clobber
           gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false

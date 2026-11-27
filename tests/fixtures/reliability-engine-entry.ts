@@ -5,10 +5,11 @@ import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
 import ExcelJS from 'exceljs'
-import { app, safeStorage, session } from 'electron'
+import { app, net, safeStorage, session } from 'electron'
 import { ApiError, WorkerApi } from '../../src/main/api'
 import { LocalDb } from '../../src/main/db'
 import { SyncEngine } from '../../src/main/sync-engine'
+import { DesktopStorageRouter } from '../../src/main/desktop-storage-router'
 
 const projectRoot = process.env.EXCELSYNC_PROJECT_ROOT || process.cwd()
 const artifactRoot = process.env.EXCELSYNC_REAL_E2E_ARTIFACT_ROOT || join(projectRoot, 'test-artifacts', 'reliability-20261125', 'real-e2e')
@@ -22,11 +23,12 @@ const stateRoot = join(artifactRoot, 'fixture-state', runId)
 const dbPath = join(stateRoot, 'excel-sync.sqlite')
 const fileName = `Codex-Reliability-${runId}.xlsx`
 
-type EvidenceRequest = { route: string; status?: number; ms: number; errorCode?: string }
+type EvidenceRequest = { route: string; status?: number; ms: number; serverTiming?: string | null; errorCode?: string }
 const requests: EvidenceRequest[] = []
 const report: Record<string, unknown> = {
   startedAt: new Date().toISOString(),
   mode: 'fixture-sync-e2e',
+  transport: 'electron.net.fetch (same as desktop main process)',
   requestBudget: 200,
   requests,
   fixtureWorkspaceCreated: false,
@@ -154,8 +156,8 @@ async function main(): Promise<void> {
     if (fetchCount > 200) throw Object.assign(new Error('REQUEST_BUDGET_EXCEEDED'), { code: 'REQUEST_BUDGET_EXCEEDED' })
     const started = Date.now()
     try {
-      const response = await globalThis.fetch(url, scopedInit)
-      requests.push({ route: routeLabel(url), status: response.status, ms: Date.now() - started })
+      const response = await net.fetch(url.toString(), scopedInit)
+      requests.push({ route: routeLabel(url), status: response.status, ms: Date.now() - started, serverTiming: response.headers.get('server-timing') })
       reportWrite()
       return response
     } catch (error) {
@@ -218,7 +220,7 @@ async function main(): Promise<void> {
     ...localDb.getSettings(), syncDirectory: fixtureRoot, workerUrl: workerBase, autoSync: true,
     retryBaseSeconds: 2, defaultStorageBackend: 'telegram_bot' as const
   }
-  engine = new SyncEngine(localDb, api)
+  engine = new SyncEngine(localDb, api, {}, new DesktopStorageRouter(api, {} as never))
   await engine.start(settings)
   engineStarted = true
   await engine.pullRemoteChanges(true)
@@ -362,7 +364,7 @@ async function main(): Promise<void> {
   localDb = new LocalDb(dbPath)
   const recoveredPendingBefore = pendingRow(localDb, fileId)
   if (!recoveredPendingBefore?.upload_receipt) throw Object.assign(new Error('RECEIPT_DID_NOT_SURVIVE_SQLITE_REOPEN'), { code: 'RECEIPT_DID_NOT_SURVIVE_SQLITE_REOPEN' })
-  engine = new SyncEngine(localDb, api)
+  engine = new SyncEngine(localDb, api, {}, new DesktopStorageRouter(api, {} as never))
   const recoveryRequestStart = requests.length
   localDb.requeuePending(String(recoveredPendingBefore.id))
   await engine.start({ ...settings, autoSync: false })
@@ -409,7 +411,7 @@ async function main(): Promise<void> {
   await engine.stop()
   engineStarted = false
   networkOffline = true
-  engine = new SyncEngine(localDb, api)
+  engine = new SyncEngine(localDb, api, {}, new DesktopStorageRouter(api, {} as never))
   await engine.start(settings)
   engineStarted = true
   const offlineBook = new ExcelJS.Workbook()
@@ -430,7 +432,7 @@ async function main(): Promise<void> {
   if (survived?.hash !== offlineHash) throw new Error('OFFLINE_QUEUE_LOST_ON_RESTART')
   networkOffline = false
   localDb.requeuePending(String(offlinePending.id))
-  engine = new SyncEngine(localDb, api)
+  engine = new SyncEngine(localDb, api, {}, new DesktopStorageRouter(api, {} as never))
   await engine.start({ ...settings, autoSync: false })
   engineStarted = true
   engine.setPaused(false)
@@ -457,11 +459,24 @@ async function main(): Promise<void> {
   const uploadMs = Date.now() - transferStarted
   const downloadStarted = Date.now()
   const csvCloud = await api.downloadCurrent(csvFile.id)
+  const bufferedDownloadMs = Date.now() - downloadStarted
+  const diskStarted = Date.now()
+  const benchmarkBytes = await readFile(csvPath)
+  const readMs = Date.now() - diskStarted
+  const hashStarted = Date.now()
+  const benchmarkHash = sha256(benchmarkBytes)
+  const hashMs = Date.now() - hashStarted
+  const streamStarted = Date.now()
+  const streamed = await api.downloadTo(csvFile.id, join(stateRoot, 'large-csv-download.csv'))
+  const streamDownloadMs = Date.now() - streamStarted
+  const writtenHash = sha256(await readFile(join(stateRoot, 'large-csv-download.csv')))
   const csvVersion = await api.versions(csvFile.id)
-  report.largeCsv = { bytes: csvBytes.byteLength, uploadMs, downloadMs: Date.now() - downloadStarted,
+  report.largeCsv = { bytes: csvBytes.byteLength, uploadMs, downloadMs: bufferedDownloadMs,
+    readMs, hashMs, streamDownloadMs, streamedHash: streamed.hash, writtenHash, benchmarkHash,
     localHash: csvFile.current_hash, downloadedHash: sha256(csvCloud.bytes), d1Hash: csvVersion[0]?.hash,
     version: csvCloud.version, shaMatches: csvHash === sha256(csvCloud.bytes) && csvVersion[0]?.hash === csvHash }
   if (csvHash !== sha256(csvCloud.bytes) || csvVersion[0]?.hash !== csvHash) throw new Error('LARGE_CSV_HASH_MISMATCH')
+  if (streamed.hash !== csvHash || writtenHash !== csvHash || benchmarkHash !== csvHash) throw new Error('STREAM_CSV_HASH_MISMATCH')
 
   report.defaultWorkspacePreserved = (await api.workspaces()).defaultWorkspaceId === originalDefaultId
   if (!report.defaultWorkspacePreserved) throw Object.assign(new Error('ACCOUNT_DEFAULT_WORKSPACE_CHANGED'), { code: 'ACCOUNT_DEFAULT_WORKSPACE_CHANGED' })
