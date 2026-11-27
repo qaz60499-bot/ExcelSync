@@ -1,6 +1,7 @@
 const fs = require('fs')
 const cp = require('child_process')
 const path = require('path')
+const { runtimeDependencies } = require('./runtime-dependencies.cjs')
 
 const reportDir = process.argv[2] || path.join('test-artifacts', 'security-validation')
 fs.mkdirSync(reportDir, { recursive: true })
@@ -69,6 +70,7 @@ const runtimeSource = ['src/main/preview.ts', 'src/main/version-diff.ts']
   .map((file) => fs.readFileSync(file, 'utf8'))
   .join('\n')
 const exceljsRuntimeReferenced = /from\s+['\"]exceljs['\"]|require\(['\"]exceljs['\"]\)/.test(runtimeSource)
+const runtimePackages = runtimeDependencies(pkg, packages, exceljsRuntimeReferenced ? ['exceljs'] : [])
 const excelUuidSources = []
 function collectJs(directory) {
   if (!fs.existsSync(directory)) return
@@ -111,7 +113,7 @@ for (const [name, vuln] of Object.entries(audit.vulnerabilities || {})) {
     continue
   }
 
-  const runtimeReachable = name === 'exceljs' ? exceljsRuntimeReferenced : false
+  const runtimeReachable = nodes.some((nodePath) => runtimePackages.has(nodePath))
   const devOnly = lockfileDevFlagOnly && !runtimeReachable
   const classification = devOnly ? 'dev-only' : 'potentially production-reachable'
   finding('npm-audit', vuln.severity || 'unknown', name, `${classification}; range=${vuln.range || 'unknown'}`, devOnly ? 'EXPECTED / NOT EXPLOITABLE' : 'SECURITY BUG')
@@ -123,6 +125,7 @@ const summary = {
   auditExit,
   version: pkg.version,
   lifecycleScripts: lifecycle,
+  runtimePackages: [...runtimePackages].sort(),
   npmAuditCounts: audit.metadata?.vulnerabilities || {},
   findings,
   failures

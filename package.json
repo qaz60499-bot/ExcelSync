@@ -1,6 +1,6 @@
 {
   "name": "excel-sync",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "private": true,
   "description": "Windows multi-user file workspace backed by Cloudflare D1 and pluggable storage",
   "main": "out/main/index.js",
@@ -37,14 +37,14 @@
     "chokidar": "^4.0.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "zod": "^4.1.11"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
     "@vitejs/plugin-react": "^5.0.4",
-    "electron": "44.0.0",
+    "electron": "44.11.6",
     "electron-builder": "^26.0.12",
     "electron-vite": "^5.0.0",
     "exceljs": "^4.4.0",
