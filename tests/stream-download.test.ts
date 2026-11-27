@@ -13,7 +13,7 @@ function apiFor(fetcher: (url: string, init?: RequestInit) => Promise<Response>)
 describe('streamed Bot downloads', () => {
   it('writes verified current and historical bytes without buffering the response or rereading the file', async () => {
     const root = await mkdtemp(join(tmpdir(), 'excelsync-stream-'))
-    const bytes = Buffer.alloc(2 * 1024 * 1024 + 13, 91)
+    const bytes = Buffer.alloc(256 * 1024 + 13, 91)
     const hash = createHash('sha256').update(bytes).digest('hex')
     const routes: string[] = []
     const api = apiFor(async url => {

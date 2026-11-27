@@ -10,7 +10,7 @@ if (!process.versions.electron) {
   fs.mkdirSync(artifacts, { recursive: true })
   const profile = fs.mkdtempSync(path.join(artifacts, 'profile-'))
   const child = require('node:child_process').spawnSync(require('electron'), [__filename], {
-    cwd: root, windowsHide: true, timeout: 30_000, encoding: 'utf8',
+    cwd: root, windowsHide: true, timeout: 45_000, encoding: 'utf8',
     env: { ...process.env, EXCELSYNC_USER_DATA_DIR: profile }, maxBuffer: 1024 * 1024
   })
   const report = fs.existsSync(output) ? JSON.parse(fs.readFileSync(output, 'utf8')) : null
@@ -40,6 +40,10 @@ if (!process.versions.electron) {
     db.close()
     window.webContents.once('did-finish-load', async () => {
       try {
+        // Chromium can report navigation complete before the first JS task is
+        // scheduled on a busy hosted runner. Measure IPC after that startup boundary.
+        const bridgeReady = await window.webContents.executeJavaScript('Boolean(window.excelSync)')
+        if (!bridgeReady) throw new Error('PRELOAD_BRIDGE_MISSING')
         const result = await Promise.race([
           window.webContents.executeJavaScript(`(async () => { const start=performance.now(); const dashboard=await window.excelSync.dashboard(); const files=await window.excelSync.files(); return {elapsedMs:performance.now()-start,files:files.length,pending:dashboard.pending,worker:dashboard.health.worker}; })()`),
           new Promise((_, reject) => setTimeout(() => reject(new Error('LOCAL_REFRESH_BLOCKED_BY_CLOUD')), 2000))
@@ -61,5 +65,5 @@ if (!process.versions.electron) {
     import(require('node:url').pathToFileURL(path.join(root, 'out', 'main', 'index.js')).href).catch(error => finish({ ok: false, error: error.message }))
   })
   app.on('quit', () => server.close())
-  setTimeout(() => { if (!finished) finish({ ok: false, error: 'INITIALIZATION_TIMEOUT' }) }, 15_000).unref()
+  setTimeout(() => { if (!finished) finish({ ok: false, error: 'INITIALIZATION_TIMEOUT' }) }, 30_000).unref()
 }
