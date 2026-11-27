@@ -1725,7 +1725,9 @@ async function commitUploadedIntent(env: RuntimeEnv, auth: RequestAuth, intent: 
     ).bind(eventId, user.id, intent.file_id, `V${newVersion}`, timestamp, versionId)
   ])
 
-  if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) !== 1) {
+  // files.id is unique; D1 counts AFTER-trigger writes in meta.changes as well.
+  // A failed CAS still changes zero rows and fires no revision trigger.
+  if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) < 1) {
     const latestIntent = await env.DB.prepare(
       'SELECT status FROM upload_intents WHERE id = ? AND owner_user_id = ? LIMIT 1'
     ).bind(intent.id, user.id).first<{ status: IntentRow['status'] }>()
@@ -1801,7 +1803,7 @@ async function handleRename(request: Request, env: RuntimeEnv, user: AuthUser, f
   )
     .bind(logicalName, relativePath, timestamp, user.id, user.id, fileId, file.workspace_id, input.baseVersion)
     .run()
-  if ((result.meta.changes ?? 0) !== 1) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
+  if ((result.meta.changes ?? 0) < 1) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
   await recordEvent(env, user.id, fileId, 'RENAME', relativePath)
   const eventId = await recordDomainEvent(env, {
     organizationId: user.organizationId,
@@ -1844,7 +1846,7 @@ export async function handleTrash(request: Request, env: RuntimeEnv, user: AuthU
   )
     .bind(timestamp, user.id, timestamp, user.id, user.id, fileId, file.workspace_id, input.baseVersion)
     .run()
-  if ((result.meta.changes ?? 0) !== 1) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
+  if ((result.meta.changes ?? 0) < 1) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
   await recordEvent(env, user.id, fileId, 'SAAS_TRASHED', `base=${input.baseVersion}`)
   const eventId = await recordDomainEvent(env, {
     organizationId: user.organizationId,
@@ -1871,7 +1873,7 @@ export async function handlePermanentDelete(env: RuntimeEnv, user: AuthUser, fil
         SET status = 'deleted', updated_at = ?, updated_by = ?, updated_by_user_id = ?
       WHERE id = ? AND workspace_id = ? AND status = 'trashed'`
   ).bind(timestamp, user.id, user.id, fileId, file.workspace_id).run()
-  if ((result.meta.changes ?? 0) !== 1) throw new HttpError(409, 'FILE_NOT_TRASHED')
+  if ((result.meta.changes ?? 0) < 1) throw new HttpError(409, 'FILE_NOT_TRASHED')
   await recordEvent(env, user.id, fileId, 'SAAS_PERMANENTLY_DELETED', `V${file.current_version}; storage object retained by provider policy`)
   const eventId = await recordDomainEvent(env, {
     organizationId: user.organizationId,
@@ -1905,7 +1907,7 @@ export async function handleRestoreFromTrash(env: RuntimeEnv, user: AuthUser, fi
   )
     .bind(timestamp, user.id, user.id, fileId, file.workspace_id)
     .run()
-  if ((result.meta.changes ?? 0) !== 1) throw new HttpError(409, 'FILE_NOT_TRASHED')
+  if ((result.meta.changes ?? 0) < 1) throw new HttpError(409, 'FILE_NOT_TRASHED')
   const restored = await env.DB.prepare(
     `SELECT f.id, f.logical_name, f.relative_path, f.current_version, f.current_hash, f.status,
             COALESCE(v.size, 0) AS size
@@ -2122,7 +2124,7 @@ async function handleRestore(
         WHERE EXISTS (SELECT 1 FROM file_versions WHERE id = ?)`
     ).bind(eventId, user.id, file.id, `V${newVersion} restored from V${source.version}`, timestamp, versionId)
   ])
-  if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) !== 1) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
+  if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) < 1) throw new HttpError(409, 'BASE_VERSION_CONFLICT')
   const domainEventId = await recordDomainEvent(env, {
     organizationId: user.organizationId,
     workspaceId: file.workspace_id,
@@ -2230,7 +2232,7 @@ async function importTelegramDocument(
       ).bind(versionId, fileId, newVersion, document.file_id, message.message_id, document.file_unique_id ?? null,
         hash, bytes.byteLength, timestamp, user.id, LEGACY_STORAGE_CONNECTION_ID)
     ])
-    if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) !== 1) throw new HttpError(503, 'TELEGRAM_IMPORT_PERSIST_FAILED')
+    if ((batch[0]?.meta.changes ?? 0) < 1 || (batch[1]?.meta.changes ?? 0) !== 1) throw new HttpError(503, 'TELEGRAM_IMPORT_PERSIST_FAILED')
   } else {
     const batch = await env.DB.batch([
       env.DB.prepare(
@@ -2247,7 +2249,7 @@ async function importTelegramDocument(
       ).bind(logicalName, relativePath, newVersion, document.file_id, message.message_id, hash, timestamp, user.id, user.id,
         fileId, workspaceId, baseVersion)
     ])
-    if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) !== 1) throw new HttpError(409, 'TELEGRAM_IMPORT_CONFLICT')
+    if ((batch[0]?.meta.changes ?? 0) !== 1 || (batch[1]?.meta.changes ?? 0) < 1) throw new HttpError(409, 'TELEGRAM_IMPORT_CONFLICT')
   }
 
   await env.DB.batch([

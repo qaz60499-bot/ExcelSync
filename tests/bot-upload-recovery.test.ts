@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
+import { totalChanges } from './fixtures/d1-changes'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { appFetch } from '../worker/src/index'
 import { sha256Hex, sha256Text } from '../worker/src/auth'
@@ -77,8 +78,9 @@ class SqliteD1 {
       const result = this.database.prepare(sql).run(...values)
       throw new Error(`injected D1 metadata failure after write (${Number(result.changes)})`)
     }
-    const result = this.database.prepare(sql).run(...values)
-    return { success: true, meta: { changes: Number(result.changes) } }
+    const before = totalChanges(this.database)
+    this.database.prepare(sql).run(...values)
+    return { success: true, meta: { changes: totalChanges(this.database) - before } }
   }
   exec(sql: string): void { this.database.exec(sql) }
   close(): void { this.database.close() }
@@ -95,7 +97,8 @@ function applyMigrations(db: SqliteD1): void {
     '0007_version_acl_scopes.sql',
     '0008_resilience_accounts_presence.sql',
     '0009_collaboration_recovery_search.sql',
-    '0010_dual_telegram_storage.sql'
+    '0010_dual_telegram_storage.sql',
+    '0011_file_list_revision.sql'
   ]) db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
 }
 
@@ -244,6 +247,61 @@ afterEach(() => {
 })
 
 describe('Worker Bot upload recovery', () => {
+  it('keeps file lifecycle CAS outcomes correct with D1 trigger-inclusive changes', async () => {
+    const { db, env, token, workspaceId } = await bootstrap()
+    installTelegramSuccessMock()
+    try {
+      const intent = await reserveIntent(env, token, workspaceId, 'trigger-cas.xlsx', 'trigger-cas-upload-key-001')
+      const payload = await json<{ receipt: BotUploadReceipt }>(await upload(env, token, intent.intentId))
+      await finishWithReceipt(env, token, intent.intentId, payload.receipt)
+      const count = await db.prepare('UPDATE files SET logical_name=logical_name WHERE id=?').bind(intent.fileId).run()
+      expect(count.meta.changes).toBe(2)
+      const rename = (baseVersion: number) => request(env, `/files/${intent.fileId}/rename`, {
+        method: 'POST', token, body: { logicalName: 'renamed.xlsx', relativePath: 'Moved/renamed.xlsx', baseVersion }
+      })
+      expect((await rename(0)).status).toBe(409)
+      expect((await rename(1)).status).toBe(200)
+      expect(db.database.prepare('SELECT relative_path FROM files WHERE id=?').get(intent.fileId)?.relative_path).toBe('Moved/renamed.xlsx')
+      const trash = () => request(env, `/files/${intent.fileId}/trash`, { method: 'POST', token, body: { baseVersion: 1 } })
+      expect((await trash()).status).toBe(200)
+      expect((await trash()).status).toBe(409)
+      expect((await request(env, `/files/${intent.fileId}/restore-from-trash`, { method: 'POST', token })).status).toBe(200)
+      expect((await trash()).status).toBe(200)
+      expect((await request(env, `/files/${intent.fileId}/permanent-delete`, { method: 'POST', token })).status).toBe(200)
+      expect(db.database.prepare('SELECT status,current_version FROM files WHERE id=?').get(intent.fileId)).toMatchObject({ status: 'deleted', current_version: 1 })
+      expect(db.database.prepare('SELECT COUNT(*) AS n FROM file_versions WHERE file_id=?').get(intent.fileId)?.n).toBe(1)
+    } finally { db.close() }
+  })
+
+  it('imports new and updated Telegram documents once with revision triggers enabled', async () => {
+    const { db, env, token } = await bootstrap()
+    let revision = 1
+    let documentReads = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/getUpdates')) return Response.json({ ok: true, result: JSON.parse(String(init?.body)).offset > revision ? [] : [{ update_id: revision,
+        message: { message_id: revision, date: 1795708800, chat: { id: 'bot-chat', type: 'private' },
+          document: { file_id: `import-${revision}`, file_unique_id: `unique-${revision}`, file_name: 'trigger-import.csv', file_size: 8 } }
+      }] })
+      if (url.includes('/getFile')) return Response.json({ ok: true, result: { file_path: `documents/import-${revision}.csv` } })
+      if (url.includes('/file/bot')) { documentReads++; return new Response(`a,b\n1,${revision}\n`) }
+      return new Response('{}', { status: 404 })
+    }))
+    try {
+      const pull = () => request(env, '/storage/import/pull', { method: 'POST', token })
+      const first = await pull()
+      expect(first.status).toBe(200)
+      const id = (await json<{ imported: { fileId: string }[] }>(first)).imported[0]!.fileId
+      revision = 2
+      expect((await pull()).status).toBe(200)
+      expect((await pull()).status).toBe(200)
+      expect(db.database.prepare('SELECT current_version FROM files WHERE id=?').get(id)?.current_version).toBe(2)
+      expect(db.database.prepare('SELECT COUNT(*) AS n FROM file_versions WHERE file_id=?').get(id)?.n).toBe(2)
+      expect(documentReads).toBe(2)
+      expect(db.database.prepare("SELECT value FROM app_settings WHERE key='telegram_import_offset'").get()?.value).toBe('2')
+    } finally { db.close() }
+  })
+
   it.each(['before', 'after'] as const)('recovers a Telegram success when the D1 metadata write fails %s the write', async (fault) => {
     const { db, env, token, workspaceId } = await bootstrap()
     const calls = installTelegramSuccessMock()

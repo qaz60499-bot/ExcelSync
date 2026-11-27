@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
+import { totalChanges } from './fixtures/d1-changes'
 import { describe, expect, it } from 'vitest'
 import { appFetch } from '../worker/src/index'
 import { sha256Text } from '../worker/src/auth'
@@ -20,8 +21,9 @@ class SqliteStatement {
     return { results: this.db.database.prepare(this.sql).all(...this.values) as T[] }
   }
   async run(): Promise<{ success: boolean; meta: { changes: number } }> {
-    const result = this.db.database.prepare(this.sql).run(...this.values)
-    return { success: true, meta: { changes: Number(result.changes) } }
+    const before = totalChanges(this.db.database)
+    this.db.database.prepare(this.sql).run(...this.values)
+    return { success: true, meta: { changes: totalChanges(this.db.database) - before } }
   }
 }
 
@@ -55,7 +57,8 @@ function applyMigrations(db: SqliteD1): void {
     '0007_version_acl_scopes.sql',
     '0008_resilience_accounts_presence.sql',
     '0009_collaboration_recovery_search.sql',
-    '0010_dual_telegram_storage.sql'
+    '0010_dual_telegram_storage.sql',
+    '0011_file_list_revision.sql'
   ]) db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
 }
 
