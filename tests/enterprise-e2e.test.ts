@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
+import { totalChanges } from './fixtures/d1-changes'
 import { describe, expect, it, vi } from 'vitest'
 import { appFetch } from '../worker/src/index'
 import { sha256Text } from '../worker/src/auth'
@@ -21,8 +22,9 @@ class SqliteStatement {
     return { results: this.db.database.prepare(this.sql).all(...this.values) as T[] }
   }
   async run(): Promise<{ success: boolean; meta: { changes: number } }> {
-    const result = this.db.database.prepare(this.sql).run(...this.values)
-    return { success: true, meta: { changes: Number(result.changes) } }
+    const before = totalChanges(this.db.database)
+    this.db.database.prepare(this.sql).run(...this.values)
+    return { success: true, meta: { changes: totalChanges(this.db.database) - before } }
   }
 }
 
@@ -56,7 +58,8 @@ function applyMigrations(db: SqliteD1): void {
     '0007_version_acl_scopes.sql',
     '0008_resilience_accounts_presence.sql',
     '0009_collaboration_recovery_search.sql',
-    '0010_dual_telegram_storage.sql'
+    '0010_dual_telegram_storage.sql',
+    '0011_file_list_revision.sql'
   ]) {
     db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'))
   }
@@ -169,6 +172,15 @@ describe('ExcelSync 1.3 multi-user Worker E2E', () => {
       )
       expect(userGroupVersions.versions[0]?.storage_backend).toBe('telegram_user_group')
       expect(userGroupVersions.versions[0]?.storage_locator).toContain('4242')
+      db.database.prepare('UPDATE files SET current_version = 1000000 WHERE id = ?').run(userGroupPreflight.fileId)
+      const boundedHistory = await json<{ versions: Array<{ version: number }>; hasOlderVersions: boolean }>(
+        await request(env, `/versions/${userGroupPreflight.fileId}`, { token: ownerLogin.token })
+      )
+      expect(boundedHistory.versions).toHaveLength(500)
+      expect(boundedHistory.versions[0]?.version).toBe(1000000)
+      expect(boundedHistory.versions.at(-1)?.version).toBe(999501)
+      expect(boundedHistory.hasOlderVersions).toBe(true)
+      db.database.prepare('UPDATE files SET current_version = 1 WHERE id = ?').run(userGroupPreflight.fileId)
       db.database.prepare('UPDATE workspaces SET default_storage_connection_id = ? WHERE id = ?').run(previousStorage.id, workspaceId)
 
       const botOverLimit = await request(env, '/sync/preflight', {

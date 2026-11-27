@@ -22,7 +22,7 @@ describe('Telegram private-group upload performance regressions', () => {
     expect(bridge).toContain('uploaded_file = await client.upload_file(')
     expect(bridge).toContain('part_size_kb=UPLOAD_PART_SIZE_KB')
     expect(bridge).toContain('file_size=size')
-    expect(bridge).toContain('await client.send_file(\n        entity,\n        uploaded_file,')
+    expect(bridge).toMatch(/await client\.send_file\(\s+entity,\s+uploaded_file,/)
   })
 
   it('keeps multiple independent sync jobs available for aggregate throughput', async () => {

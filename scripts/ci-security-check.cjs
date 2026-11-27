@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const cp = require('child_process');
+const projectRoot = path.resolve(__dirname, '..');
+const gitPrefix = ['-c', `safe.directory=${projectRoot.replace(/\\/g, '/')}`];
 
 const forbiddenTracked = [
   /^\.env(?:\.|$)/,
@@ -17,7 +19,7 @@ const secretPatterns = [
   /CLOUDFLARE_API_TOKEN\s*[=:]\s*['\"](?!test|dummy|fake|example)[A-Za-z0-9_-]{30,}['\"]/i,
   /TELEGRAM_(?:USER_)?SESSION\s*[=:]\s*['\"](?!test|dummy|fake|example)[A-Za-z0-9_+=\/-]{40,}['\"]/i,
 ];
-const tracked = cp.execFileSync('git', ['ls-files'], { encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+const tracked = cp.execFileSync('git', [...gitPrefix, 'ls-files'], { cwd: projectRoot, encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
 const badFiles = tracked.filter(f => forbiddenTracked.some(r => r.test(f.replace(/\\/g, '/'))));
 if (badFiles.length) {
   console.error('Forbidden tracked sensitive files:\n' + badFiles.join('\n'));
@@ -25,7 +27,7 @@ if (badFiles.length) {
 }
 let leaks = [];
 for (const file of tracked) {
-  const full = path.resolve(file);
+  const full = path.resolve(projectRoot, file);
   if (!fs.existsSync(full) || fs.statSync(full).size > 2 * 1024 * 1024) continue;
   const text = fs.readFileSync(full, 'utf8');
   for (const re of secretPatterns) if (re.test(text)) leaks.push(`${file}: ${re}`);
@@ -35,7 +37,8 @@ if (leaks.length) {
   process.exit(1);
 }
 
-const historyNames = cp.execFileSync('git', ['log', '--all', '--name-only', '--pretty=format:'], {
+const historyNames = cp.execFileSync('git', [...gitPrefix, 'log', '--all', '--name-only', '--pretty=format:'], {
+  cwd: projectRoot,
   encoding: 'utf8',
   maxBuffer: 20 * 1024 * 1024,
 });
@@ -46,7 +49,8 @@ if (badHistoryFiles.length) {
   process.exit(1);
 }
 
-const historyPatch = cp.execFileSync('git', ['log', '-p', '--all', '--no-ext-diff', '--pretty=format:'], {
+const historyPatch = cp.execFileSync('git', [...gitPrefix, 'log', '-p', '--all', '--no-ext-diff', '--pretty=format:'], {
+  cwd: projectRoot,
   encoding: 'utf8',
   maxBuffer: 50 * 1024 * 1024,
 });

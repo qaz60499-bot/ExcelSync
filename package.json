@@ -1,6 +1,6 @@
 {
   "name": "excel-sync",
-  "version": "1.4.1",
+  "version": "1.4.3",
   "private": true,
   "description": "Windows multi-user file workspace backed by Cloudflare D1 and pluggable storage",
   "main": "out/main/index.js",
@@ -81,6 +81,10 @@
       {
         "from": "scripts/telegram-storage-bridge.py",
         "to": "telegram-storage-bridge.py"
+      },
+      {
+        "from": "scripts/telegram_storage_bridge_support.py",
+        "to": "telegram_storage_bridge_support.py"
       }
     ],
     "win": {

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from telegram_storage_bridge_support import find_authorized_dialog_entity, immutable_upload_snapshot
+
 try:
     import cryptg  # noqa: F401 - Telethon auto-detects this native AES implementation.
     from telethon import TelegramClient, events, utils
@@ -166,6 +168,15 @@ async def get_bound_entity() -> Any:
         return await client.get_entity(int(bound_chat_id))
     except ValueError:
         return await client.get_entity(bound_chat_id)
+
+
+async def get_download_entity(chat_id: str) -> Any:
+    if not chat_id:
+        raise RuntimeError("TELEGRAM_CHAT_ID_INVALID")
+    if str(chat_id) == str(bound_chat_id):
+        return await get_bound_entity()
+    await ensure_connected(15.0)
+    return await find_authorized_dialog_entity(client, chat_id, utils.get_peer_id)
 
 
 async def install_listener(entity: Any) -> None:
@@ -373,52 +384,54 @@ async def upload(path: str, chat_id: str, expected_sha256: str, operation_id: st
     entity = await get_bound_entity()
     if str(utils.get_peer_id(entity)) != str(chat_id):
         raise RuntimeError("TELEGRAM_GROUP_ID_MISMATCH")
-    size = int(local.stat().st_size)
+    source_size = int(local.stat().st_size)
     started_at = time.monotonic()
-    update_transfer_progress(operation_id, "upload", local.name, "verifying", 0, size, started_at)
-    actual_hash = sha256_file(
-        str(local),
+    update_transfer_progress(operation_id, "upload", local.name, "verifying", 0, source_size, started_at)
+    with immutable_upload_snapshot(
+        local,
+        expected_sha256,
         lambda current, total: update_transfer_progress(operation_id, "upload", local.name, "verifying", current, total, started_at),
-    )
-    if expected_sha256 and actual_hash.lower() != expected_sha256.lower():
-        raise RuntimeError("UPLOAD_HASH_MISMATCH")
-
-    transfer_started_at = time.monotonic()
-    update_transfer_progress(operation_id, "upload", local.name, "transferring", 0, size, transfer_started_at)
-    uploaded_file = await client.upload_file(
-        str(local),
-        part_size_kb=UPLOAD_PART_SIZE_KB,
-        file_size=size,
-        file_name=local.name,
-        progress_callback=lambda current, total: update_transfer_progress(
-            operation_id, "upload", local.name, "transferring", int(current), int(total or size), transfer_started_at
-        ),
-    )
-    message = await client.send_file(
-        entity,
-        uploaded_file,
-        force_document=True,
-        caption=f"ExcelSync sha256={actual_hash[:16]}",
-        mime_type=mimetypes.guess_type(local.name)[0] or "application/octet-stream",
-    )
-    update_transfer_progress(operation_id, "upload", local.name, "finalizing", size, size, transfer_started_at)
-    metadata = document_metadata(message)
-    if metadata is None:
-        raise RuntimeError("TELEGRAM_UPLOAD_DOCUMENT_MISSING")
-    return {
-        "backend": "telegram_user_group",
-        "chatId": str(chat_id),
-        "messageId": int(message.id),
-        "fileName": local.name,
-        "size": size,
-        "sha256": actual_hash,
-        "mimeType": metadata["mimeType"],
-        "createdAt": iso_now(),
-    }
+    ) as snapshot:
+        size = snapshot.size
+        actual_hash = snapshot.sha256
+        transfer_started_at = time.monotonic()
+        update_transfer_progress(operation_id, "upload", local.name, "transferring", 0, size, transfer_started_at)
+        uploaded_file = await client.upload_file(
+            str(snapshot.path),
+            part_size_kb=UPLOAD_PART_SIZE_KB,
+            file_size=size,
+            file_name=local.name,
+            progress_callback=lambda current, total: update_transfer_progress(
+                operation_id, "upload", local.name, "transferring", int(current), int(total or size), transfer_started_at
+            ),
+        )
+        message = await client.send_file(
+            entity,
+            uploaded_file,
+            force_document=True,
+            caption=f"ExcelSync sha256={actual_hash[:16]}",
+            mime_type=mimetypes.guess_type(local.name)[0] or "application/octet-stream",
+        )
+        metadata = document_metadata(message)
+        if metadata is None:
+            raise RuntimeError("TELEGRAM_UPLOAD_DOCUMENT_MISSING")
+        if int(metadata["size"]) != size:
+            raise RuntimeError("TELEGRAM_UPLOAD_SIZE_MISMATCH")
+        update_transfer_progress(operation_id, "upload", local.name, "finalizing", size, size, transfer_started_at)
+        return {
+            "backend": "telegram_user_group",
+            "chatId": str(chat_id),
+            "messageId": int(message.id),
+            "fileName": local.name,
+            "size": size,
+            "sha256": actual_hash,
+            "mimeType": metadata["mimeType"],
+            "createdAt": iso_now(),
+        }
 
 
 async def download(chat_id: str, message_id: int, destination: str, operation_id: str) -> dict[str, Any]:
-    entity = await get_bound_entity()
+    entity = await get_download_entity(chat_id)
     if str(utils.get_peer_id(entity)) != str(chat_id):
         raise RuntimeError("TELEGRAM_GROUP_ID_MISMATCH")
     message = await client.get_messages(entity, ids=int(message_id))

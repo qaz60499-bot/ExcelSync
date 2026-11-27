@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, WorkerApi } from '../src/main/api'
 
 class MemorySessionStore {
@@ -19,6 +19,18 @@ function response(status: number, code = `HTTP_${status}`): Response {
     headers: { 'content-type': 'application/json' }
   })
 }
+
+function stalledResponse(status: number, contentType: string, signal?: AbortSignal): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"error":{"code":"PARTIAL'))
+      signal?.addEventListener('abort', () => controller.error(new Error('aborted by request timeout')), { once: true })
+    }
+  })
+  return new Response(body, { status, headers: { 'content-type': contentType } })
+}
+
+afterEach(() => vi.useRealTimers())
 
 function apiFor(fetcher: (input: string, init?: RequestInit) => Promise<Response>, store = new MemorySessionStore()) {
   return {
@@ -82,6 +94,67 @@ describe('WorkerApi deterministic network fault mapping', () => {
     await expect((api as any).json('/health', { method: 'GET' }, { auth: false, timeoutMs: 50 }))
       .rejects.toMatchObject({ code: 'NETWORK_ERROR', retryable: true })
     expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it('keeps the timeout active while reading a successful JSON body', async () => {
+    const { api } = apiFor(async (_input, init) => stalledResponse(200, 'application/json', init?.signal ?? undefined))
+    const started = Date.now()
+    await expect((api as any).json('/health', { method: 'GET' }, { auth: false, timeoutMs: 50 }))
+      .rejects.toMatchObject({ code: 'NETWORK_ERROR', status: 0, retryable: true })
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it('keeps the timeout active while reading a JSON HTTP error body', async () => {
+    const { api } = apiFor(async (_input, init) => stalledResponse(503, 'application/json', init?.signal ?? undefined))
+    await expect((api as any).json('/health', { method: 'GET' }, { auth: false, timeoutMs: 50 }))
+      .rejects.toMatchObject({ code: 'NETWORK_ERROR', status: 0, retryable: true })
+  })
+
+  it('cancels outstanding bodies during shutdown and permits later requests', async () => {
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    let calls = 0
+    const { api } = apiFor(async (_input, init) => {
+      if (++calls > 1) return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } })
+      const response = stalledResponse(200, 'application/json', init?.signal ?? undefined)
+      markStarted()
+      return response
+    })
+    const pending = api.health()
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'NETWORK_ERROR', retryable: true })
+    await started
+    api.cancelRequests()
+    await rejected
+    await expect(api.health()).resolves.toMatchObject({ ok: true })
+  })
+
+  it('does not wait on a stalled non-JSON HTTP error body', async () => {
+    const { api } = apiFor(async (_input, init) => stalledResponse(503, 'text/plain', init?.signal ?? undefined))
+    await expect((api as any).json('/health', { method: 'GET' }, { auth: false, timeoutMs: 500 }))
+      .rejects.toMatchObject({ code: 'HTTP_503', status: 503, retryable: true })
+  })
+
+  it('applies the timeout while downloading a binary response body', async () => {
+    vi.useFakeTimers()
+    const { api, store } = apiFor(async (_input, init) => stalledResponse(200, 'application/octet-stream', init?.signal ?? undefined))
+    store.session = { token: 'test-session-token' }
+    const download = api.downloadCurrent('file-id')
+    const rejected = expect(download).rejects.toMatchObject({ code: 'NETWORK_ERROR', status: 0, retryable: true })
+    await vi.advanceTimersByTimeAsync(180_000)
+    await rejected
+  })
+
+  it('composes a caller signal with the timeout instead of replacing the timeout', async () => {
+    const caller = new AbortController()
+    let fetchSignal: AbortSignal | undefined
+    const { api } = apiFor(async (_input, init) => {
+      fetchSignal = init?.signal ?? undefined
+      return stalledResponse(200, 'application/json', fetchSignal)
+    })
+    await expect((api as any).json('/health', { method: 'GET', signal: caller.signal }, { auth: false, timeoutMs: 50 }))
+      .rejects.toMatchObject({ code: 'NETWORK_ERROR', retryable: true })
+    expect(fetchSignal).not.toBe(caller.signal)
+    expect(caller.signal.aborted).toBe(false)
   })
 
   it('clears an authenticated session on 401 without swallowing the failure', async () => {

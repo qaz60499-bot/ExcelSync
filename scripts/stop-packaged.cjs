@@ -1,7 +1,2 @@
-const { execFileSync } = require('node:child_process')
-try {
-  execFileSync('taskkill.exe', ['/IM', 'ExcelSync.exe', '/F'], { stdio: 'ignore' })
-} catch {
-  // No running ExcelSync process is fine.
-}
-console.log('ExcelSync stopped')
+// Retained as a non-destructive diagnostic for old command invocations.
+throw new Error('Legacy forced-stop helper retired. Use the File > Exit menu of the intended ExcelSync instance so pending saves are persisted.')

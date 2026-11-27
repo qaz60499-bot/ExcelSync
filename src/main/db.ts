@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
-import type { ActivityView, CloudFileStatus, LocalFileView, PendingView, ProblemView, SettingsView, SyncStatus, TelegramUserStorageReceipt } from '../shared/contracts'
+import type { ActivityView, CloudFileStatus, LocalFileView, PendingView, ProblemView, SettingsView, SyncStatus, UploadReceipt } from '../shared/contracts'
 import type { StorageBackend } from '../shared/storage-capabilities'
 
 export type PendingOperation = 'UPSERT' | 'DELETE' | 'RENAME'
@@ -67,6 +67,17 @@ const DEFAULT_SETTINGS: SettingsView = {
 
 function nowIso(): string {
   return new Date().toISOString()
+}
+
+function uploadIdempotencyKey(
+  fileId: string,
+  baseVersion: number,
+  hash: string,
+  storageBackend: StorageBackend,
+  restoredFromVersion: number | null
+): string {
+  const restoreSuffix = restoredFromVersion === null ? '' : `:RESTORE:${restoredFromVersion}`
+  return `${fileId}:${baseVersion}:${hash}:${storageBackend}${restoreSuffix}`
 }
 
 export class LocalDb {
@@ -466,8 +477,10 @@ export class LocalDb {
       if (existing) {
         this.db.prepare(
           `UPDATE files SET relative_path = ?, logical_name = ?, extension = ?, current_version = ?, current_hash = ?,
-                            storage_backend = ?, storage_locator = ?, status = 'SYNCED', cloud_status = ?, updated_at = ? WHERE id = ?`
-        ).run(input.relativePath, input.logicalName, input.extension, input.version, input.hash, storageBackend, storageLocator, cloudStatus, timestamp, input.id)
+                            storage_backend = ?, storage_locator = ?,
+                            status = COALESCE((SELECT status FROM pending_sync WHERE file_id = ? ORDER BY created_at ASC LIMIT 1), 'SYNCED'),
+                            cloud_status = ?, updated_at = ? WHERE id = ?`
+        ).run(input.relativePath, input.logicalName, input.extension, input.version, input.hash, storageBackend, storageLocator, input.id, cloudStatus, timestamp, input.id)
       } else {
         this.db.prepare(
           `INSERT INTO files(id, relative_path, logical_name, extension, current_version, current_hash, storage_backend, storage_locator, status, cloud_status, created_at, updated_at)
@@ -490,8 +503,10 @@ export class LocalDb {
     const timestamp = nowIso()
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      this.db.prepare('DELETE FROM pending_sync WHERE file_id = ?').run(fileId)
-      this.db.prepare("UPDATE files SET status = 'SYNCED', cloud_status = 'trashed', updated_at = ? WHERE id = ?").run(timestamp, fileId)
+      this.db.prepare(
+        `UPDATE files SET status = COALESCE((SELECT status FROM pending_sync WHERE file_id = ? ORDER BY created_at ASC LIMIT 1), 'SYNCED'),
+          cloud_status = 'trashed', updated_at = ? WHERE id = ?`
+      ).run(fileId, timestamp, fileId)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -504,14 +519,85 @@ export class LocalDb {
     const timestamp = nowIso()
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      this.db.prepare('DELETE FROM pending_sync WHERE file_id = ?').run(fileId)
-      this.db.prepare("UPDATE files SET status = 'SYNCED', cloud_status = 'deleted', updated_at = ? WHERE id = ?").run(timestamp, fileId)
+      this.db.prepare(
+        `UPDATE files SET status = COALESCE((SELECT status FROM pending_sync WHERE file_id = ? ORDER BY created_at ASC LIMIT 1), 'SYNCED'),
+          cloud_status = 'deleted', updated_at = ? WHERE id = ?`
+      ).run(fileId, timestamp, fileId)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
     }
     this.log('SAAS_PERMANENTLY_DELETED', fileId)
+  }
+
+  adoptRemoteBaseline(localId: string, input: {
+    id: string
+    relativePath: string
+    logicalName: string
+    extension: string
+    version: number
+    hash: string
+    size: number
+    mtimeMs: number
+    storageBackend?: StorageBackend | null
+    storageLocator?: string | null
+  }): LocalFileRow {
+    let createdAt = ''
+    let storageBackend: StorageBackend = input.storageBackend ?? 'telegram_bot'
+    let storageLocator = input.storageLocator ?? null
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const local = this.getFile(localId)
+      const state = this.getState(localId)
+      if (!local || local.current_version !== 0 || !state || state.exists_flag !== 1) throw new Error('LOCAL_BASELINE_NOT_ADOPTABLE')
+      const occupied = this.getFileByPath(input.relativePath)
+      if (!occupied || occupied.id !== localId) throw new Error('LOCAL_BASELINE_PATH_MISMATCH')
+      const existingRemote = this.getFile(input.id)
+      if (existingRemote && existingRemote.id !== localId) throw new Error('REMOTE_BASELINE_ALREADY_EXISTS')
+
+      const pending = this.db.prepare('SELECT * FROM pending_sync WHERE file_id = ?').all(localId) as unknown as PendingRow[]
+      if (pending.length > 0) {
+        const [candidate] = pending
+        const pristineInitialUpsert = pending.length === 1 && candidate?.operation === 'UPSERT' &&
+          candidate.status === 'PENDING' && candidate.attempt_count === 0 && candidate.base_version === 0 &&
+          candidate.upload_receipt === null && candidate.retry_state === null && candidate.hash === input.hash &&
+          candidate.size === input.size && candidate.restored_from_version === null && candidate.next_retry_at === null &&
+          candidate.error_code === null && candidate.error_message === null
+        if (!pristineInitialUpsert || !candidate) throw new Error('LOCAL_BASELINE_HAS_PENDING_WORK')
+        this.db.prepare('DELETE FROM pending_sync WHERE id = ?').run(candidate.id)
+      }
+
+      const timestamp = nowIso()
+      createdAt = local.created_at
+      storageBackend = input.storageBackend ?? local.storage_backend ?? 'telegram_bot'
+      storageLocator = input.storageLocator ?? local.storage_locator ?? null
+      this.db.prepare('DELETE FROM local_versions WHERE file_id = ?').run(localId)
+      this.db.prepare('DELETE FROM local_file_state WHERE file_id = ?').run(localId)
+      this.db.prepare('DELETE FROM files WHERE id = ?').run(localId)
+      this.db.prepare(
+        `INSERT INTO files(id, relative_path, logical_name, extension, current_version, current_hash,
+                           storage_backend, storage_locator, status, cloud_status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SYNCED', 'active', ?, ?)`
+      ).run(input.id, input.relativePath, input.logicalName, input.extension, input.version, input.hash,
+        storageBackend, storageLocator, createdAt, timestamp)
+      this.db.prepare(
+        `INSERT INTO local_file_state(file_id, size, mtime_ms, last_hash, last_seen_at, exists_flag)
+         VALUES (?, ?, ?, ?, ?, 1)`
+      ).run(input.id, input.size, input.mtimeMs, input.hash, timestamp)
+      if (input.version > 0) {
+        this.db.prepare(
+          `INSERT INTO local_versions(id, file_id, version, hash, size, base_version, source_version, storage_backend, storage_locator, synced_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+        ).run(randomUUID(), input.id, input.version, input.hash, input.size, Math.max(0, input.version - 1), storageBackend, storageLocator, timestamp)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    this.log('REMOTE_BASELINE_ADOPTED', input.id, `${input.relativePath} V${input.version}`)
+    return this.getFile(input.id)!
   }
 
   upsertRemoteFile(input: {
@@ -585,6 +671,10 @@ export class LocalDb {
   }
 
   removeUnsyncedFile(fileId: string): void {
+    if (this.db.prepare("SELECT 1 FROM pending_sync WHERE file_id = ? AND (upload_receipt IS NOT NULL OR status = 'UPLOADING') LIMIT 1").get(fileId)) {
+      this.log('LOCAL_REMOVAL_UPLOAD_RETAINED', fileId, 'Upload result must be reconciled before removing its local record')
+      return
+    }
     this.db.exec('BEGIN IMMEDIATE')
     try {
       this.db.prepare('DELETE FROM pending_sync WHERE file_id = ?').run(fileId)
@@ -606,8 +696,8 @@ export class LocalDb {
         .prepare('UPDATE local_file_state SET exists_flag = 0, last_seen_at = ? WHERE file_id = ?')
         .run(timestamp, file.id)
       if (file.current_version > 0) {
-        this.db.prepare("DELETE FROM pending_sync WHERE file_id = ? AND operation IN ('UPSERT', 'RENAME', 'DELETE')").run(file.id)
-        this.db.prepare("UPDATE files SET status = 'SYNCED', updated_at = ? WHERE id = ?").run(timestamp, file.id)
+        this.db.prepare("DELETE FROM pending_sync WHERE file_id = ? AND operation IN ('UPSERT', 'RENAME', 'DELETE') AND upload_receipt IS NULL AND status != 'UPLOADING'").run(file.id)
+        this.db.prepare(`UPDATE files SET status = COALESCE((SELECT status FROM pending_sync WHERE file_id = ? ORDER BY created_at ASC LIMIT 1), 'SYNCED'), updated_at = ? WHERE id = ?`).run(file.id, timestamp, file.id)
       }
       this.db.exec('COMMIT')
     } catch (error) {
@@ -625,6 +715,11 @@ export class LocalDb {
             AND status IN ('PENDING', 'UPLOADING', 'RETRY_WAIT') LIMIT 1`
       )
       .get(fileId, hash) as { ok: number } | undefined
+    return row?.ok === 1
+  }
+
+  hasPendingWorkForFile(fileId: string): boolean {
+    const row = this.db.prepare('SELECT 1 AS ok FROM pending_sync WHERE file_id = ? LIMIT 1').get(fileId) as { ok: number } | undefined
     return row?.ok === 1
   }
 
@@ -653,6 +748,7 @@ export class LocalDb {
     }
 
     const id = randomUUID()
+    const storageBackend = this.getSettings().defaultStorageBackend
     this.db.exec('BEGIN IMMEDIATE')
     try {
       this.db.prepare(
@@ -665,8 +761,8 @@ export class LocalDb {
         file.id,
         absolutePath,
         file.current_version,
-        `${file.id}:${file.current_version}:WAITING:${file.relative_path}`,
-        this.getSettings().defaultStorageBackend,
+        `${file.id}:${file.current_version}:WAITING:${file.relative_path}:${storageBackend}`,
+        storageBackend,
         retryAt,
         errorCode,
         errorMessage.slice(0, 1000),
@@ -686,10 +782,17 @@ export class LocalDb {
   preparePendingUpload(id: string, hash: string, size: number): PendingRow | null {
     const pending = this.getPending(id)
     if (!pending || pending.operation !== 'UPSERT') return null
+    const idempotencyKey = uploadIdempotencyKey(
+      pending.file_id,
+      pending.base_version,
+      hash,
+      pending.storage_backend,
+      pending.restored_from_version
+    )
     this.db.prepare(
-      `UPDATE pending_sync SET hash = ?, size = ?, status = 'UPLOADING', next_retry_at = NULL,
+      `UPDATE pending_sync SET hash = ?, size = ?, idempotency_key = ?, status = 'UPLOADING', next_retry_at = NULL,
          error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`
-    ).run(hash, size, nowIso(), id)
+    ).run(hash, size, idempotencyKey, nowIso(), id)
     return this.getPending(id)
   }
 
@@ -729,10 +832,11 @@ export class LocalDb {
       const timestamp = nowIso()
       this.db.exec('BEGIN IMMEDIATE')
       try {
+        const idempotencyKey = uploadIdempotencyKey(file.id, file.current_version, hash, storageBackend, restoredFromVersion)
         this.db.prepare(
-          `UPDATE pending_sync SET local_path = ?, hash = ?, size = ?, base_version = ?, storage_backend = ?, restored_from_version = ?,
+          `UPDATE pending_sync SET local_path = ?, hash = ?, size = ?, base_version = ?, idempotency_key = ?, storage_backend = ?, restored_from_version = ?,
              status = 'PENDING', priority = ?, next_retry_at = NULL, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?`
-        ).run(absolutePath, hash, size, file.current_version, storageBackend, restoredFromVersion, Math.min(4, Math.max(0, priority)), timestamp, waiting.id)
+        ).run(absolutePath, hash, size, file.current_version, idempotencyKey, storageBackend, restoredFromVersion, Math.min(4, Math.max(0, priority)), timestamp, waiting.id)
         this.db.prepare("UPDATE files SET status = 'PENDING', updated_at = ? WHERE id = ?").run(timestamp, file.id)
         this.db.exec('COMMIT')
       } catch (error) {
@@ -742,9 +846,7 @@ export class LocalDb {
       this.log('WAITING_FILE_READY', file.id, `hash=${hash.slice(0, 12)}`)
       return this.getPending(waiting.id)
     }
-    const idempotencyKey = restoredFromVersion === null
-      ? `${file.id}:${file.current_version}:${hash}`
-      : `${file.id}:${file.current_version}:${hash}:RESTORE:${restoredFromVersion}`
+    const idempotencyKey = uploadIdempotencyKey(file.id, file.current_version, hash, storageBackend, restoredFromVersion)
     const existing = this.db.prepare('SELECT 1 AS ok FROM pending_sync WHERE idempotency_key = ? LIMIT 1').get(idempotencyKey) as { ok: number } | undefined
     if (existing?.ok === 1) return null
     const timestamp = nowIso()
@@ -808,10 +910,14 @@ export class LocalDb {
 
   cancelPending(fileId: string, operation?: PendingOperation): void {
     if (operation) {
-      this.db.prepare('DELETE FROM pending_sync WHERE file_id = ? AND operation = ?').run(fileId, operation)
+      this.db.prepare("DELETE FROM pending_sync WHERE file_id = ? AND operation = ? AND upload_receipt IS NULL AND status != 'UPLOADING'").run(fileId, operation)
     } else {
-      this.db.prepare('DELETE FROM pending_sync WHERE file_id = ?').run(fileId)
+      this.db.prepare("DELETE FROM pending_sync WHERE file_id = ? AND upload_receipt IS NULL AND status != 'UPLOADING'").run(fileId)
     }
+  }
+
+  discardUnuploadedPending(id: string): void {
+    this.db.prepare('DELETE FROM pending_sync WHERE id = ? AND upload_receipt IS NULL').run(id)
   }
 
   requeuePending(id: string): boolean {
@@ -836,23 +942,33 @@ export class LocalDb {
   }
 
   cancelPendingById(id: string): boolean {
-    const pending = this.getPending(id)
-    if (!pending || pending.status === 'UPLOADING') return false
-    const file = this.getFile(pending.file_id)
-    const timestamp = nowIso()
+    let cancelled: PendingRow | null = null
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      this.db.prepare("DELETE FROM pending_sync WHERE id = ? AND status != 'UPLOADING'").run(id)
+      const pending = this.getPending(id)
+      if (!pending || pending.status === 'UPLOADING' || pending.upload_receipt !== null) {
+        this.db.exec('COMMIT')
+        return false
+      }
+      const deleted = this.db.prepare("DELETE FROM pending_sync WHERE id = ? AND status != 'UPLOADING' AND upload_receipt IS NULL").run(id)
+      if (Number(deleted.changes ?? 0) !== 1) {
+        this.db.exec('COMMIT')
+        return false
+      }
+      cancelled = pending
+      const file = this.getFile(pending.file_id)
       if (file) {
-        const nextStatus: SyncStatus = file.current_version > 0 ? 'SYNCED' : 'ERROR'
-        this.db.prepare('UPDATE files SET status = ?, updated_at = ? WHERE id = ?').run(nextStatus, timestamp, file.id)
+        const remaining = this.db.prepare('SELECT status FROM pending_sync WHERE file_id = ? ORDER BY created_at ASC LIMIT 1').get(file.id) as { status: SyncStatus } | undefined
+        const nextStatus: SyncStatus = remaining?.status ?? (file.current_version > 0 ? 'SYNCED' : 'ERROR')
+        this.db.prepare('UPDATE files SET status = ?, updated_at = ? WHERE id = ?').run(nextStatus, nowIso(), file.id)
       }
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
     }
-    this.log('TASK_CANCELLED', pending.file_id, pending.operation)
+    if (!cancelled) return false
+    this.log('TASK_CANCELLED', cancelled.file_id, cancelled.operation)
     return true
   }
 
@@ -891,11 +1007,13 @@ export class LocalDb {
     )
   }
 
-  setUploadReceipt(id: string, receipt: TelegramUserStorageReceipt): PendingRow | null {
-    const locator = JSON.stringify({ chatId: receipt.chatId, messageId: receipt.messageId })
+  setUploadReceipt(id: string, receipt: UploadReceipt, intentId?: string): PendingRow | null {
+    const locator = receipt.backend === 'telegram_user_group'
+      ? JSON.stringify({ chatId: receipt.chatId, messageId: receipt.messageId }) : null
+    const retryState = JSON.stringify({ stage: 'commit_pending', intentId: receipt.backend === 'telegram_bot' ? receipt.intentId : intentId })
     this.db.prepare(
-      `UPDATE pending_sync SET upload_receipt = ?, storage_backend = 'telegram_user_group', storage_locator = ?, retry_state = NULL, updated_at = ? WHERE id = ?`
-    ).run(JSON.stringify(receipt), locator, nowIso(), id)
+      `UPDATE pending_sync SET upload_receipt = ?, storage_backend = ?, storage_locator = ?, retry_state = ?, updated_at = ? WHERE id = ?`
+    ).run(JSON.stringify(receipt), receipt.backend, locator, retryState, nowIso(), id)
     return this.getPending(id)
   }
 
@@ -982,6 +1100,10 @@ export class LocalDb {
           `SELECT * FROM pending_sync
             WHERE (status = 'PENDING'
                OR (status = 'RETRY_WAIT' AND (next_retry_at IS NULL OR next_retry_at <= ?)))${exclusion}
+              AND EXISTS (SELECT 1 FROM files cloud_file WHERE cloud_file.id = pending_sync.file_id AND cloud_file.cloud_status = 'active')
+              AND (upload_receipt IS NOT NULL OR NOT EXISTS (
+                SELECT 1 FROM pending_sync receipt WHERE receipt.file_id = pending_sync.file_id AND receipt.upload_receipt IS NOT NULL
+              ))
             ORDER BY ${order} LIMIT 1`
         )
         .get(now, ...excludeFileIds) as PendingRow | undefined) ?? null
@@ -1006,26 +1128,46 @@ export class LocalDb {
   }
 
   setPendingStorageBackendForFile(fileId: string, backend: StorageBackend): number {
-    const result = this.db.prepare(
-      `UPDATE pending_sync SET storage_backend = ?, storage_locator = NULL, updated_at = ?
+    const rows = this.db.prepare(
+      `SELECT id, hash, base_version, restored_from_version FROM pending_sync
         WHERE file_id = ? AND operation = 'UPSERT' AND status IN ('PENDING','RETRY_WAIT')
           AND upload_receipt IS NULL`
-    ).run(backend, nowIso(), fileId)
-    return Number(result.changes ?? 0)
+    ).all(fileId) as Array<{ id: string; hash: string | null; base_version: number; restored_from_version: number | null }>
+    if (rows.length === 0) return 0
+    const timestamp = nowIso()
+    const update = this.db.prepare(
+      `UPDATE pending_sync SET storage_backend = ?, storage_locator = NULL, idempotency_key = ?, updated_at = ? WHERE id = ?`
+    )
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const row of rows) {
+        const key = row.hash
+          ? uploadIdempotencyKey(fileId, row.base_version, row.hash, backend, row.restored_from_version)
+          : `${fileId}:${row.base_version}:WAITING:${row.id}:${backend}`
+        update.run(backend, key, timestamp, row.id)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return rows.length
   }
 
   rebaseQueuedForFile(fileId: string, baseVersion: number): void {
     const rows = this.db.prepare(
-      `SELECT id, hash FROM pending_sync
-        WHERE file_id = ? AND status IN ('PENDING','RETRY_WAIT') ORDER BY created_at ASC`
-    ).all(fileId) as Array<{ id: string; hash: string | null }>
+      `SELECT id, hash, storage_backend, restored_from_version FROM pending_sync
+        WHERE file_id = ? AND status IN ('PENDING','RETRY_WAIT') AND upload_receipt IS NULL ORDER BY created_at ASC`
+    ).all(fileId) as Array<{ id: string; hash: string | null; storage_backend: StorageBackend; restored_from_version: number | null }>
     if (rows.length === 0) return
     const update = this.db.prepare('UPDATE pending_sync SET base_version = ?, idempotency_key = ?, updated_at = ? WHERE id = ?')
     const timestamp = nowIso()
     this.db.exec('BEGIN IMMEDIATE')
     try {
       for (const row of rows) {
-        const key = row.hash ? `${fileId}:${baseVersion}:${row.hash}` : `${fileId}:${baseVersion}:WAITING:${row.id}`
+        const key = row.hash
+          ? uploadIdempotencyKey(fileId, baseVersion, row.hash, row.storage_backend, row.restored_from_version)
+          : `${fileId}:${baseVersion}:WAITING:${row.id}:${row.storage_backend}`
         update.run(baseVersion, key, timestamp, row.id)
       }
       this.db.exec('COMMIT')
@@ -1138,9 +1280,11 @@ export class LocalDb {
     try {
       this.db
         .prepare(
-          `UPDATE files SET current_version = ?, current_hash = ?, storage_backend = ?, storage_locator = ?, status = 'SYNCED', updated_at = ? WHERE id = ?`
+          `UPDATE files SET current_version = ?, current_hash = ?, storage_backend = ?, storage_locator = ?,
+            status = COALESCE((SELECT status FROM pending_sync WHERE file_id = ? AND id != ? ORDER BY created_at ASC LIMIT 1), 'SYNCED'),
+            updated_at = ? WHERE id = ?`
         )
-        .run(version, hash, pending.storage_backend, pending.storage_locator, timestamp, pending.file_id)
+        .run(version, hash, pending.storage_backend, pending.storage_locator, pending.file_id, id, timestamp, pending.file_id)
       this.db
         .prepare(
           `INSERT INTO local_versions(id, file_id, version, hash, size, base_version, source_version, storage_backend, storage_locator, synced_at)
@@ -1237,8 +1381,19 @@ export class LocalDb {
       errorCode: row.error_code,
       errorMessage: row.error_message,
       createdAt: row.created_at,
-      updatedAt: row.updated_at
+      updatedAt: row.updated_at,
+      storageBackend: row.storage_backend,
+      hasUploadReceipt: Boolean(row.upload_receipt),
+      syncStage: row.upload_receipt ? 'commit_pending' : this.pendingStage(row)
     }))
+  }
+
+  private pendingStage(row: PendingRow): PendingView['syncStage'] {
+    try {
+      const stage = JSON.parse(row.retry_state ?? 'null')?.stage
+      if (['waiting', 'checking', 'uploading', 'commit_pending'].includes(stage)) return stage
+    } catch { /* Older retry state is optional diagnostic data. */ }
+    return row.status === 'UPLOADING' ? 'checking' : 'waiting'
   }
 
   problemCenter(): ProblemView[] {

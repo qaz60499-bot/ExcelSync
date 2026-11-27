@@ -1,17 +1,25 @@
-import { copyFile, mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, link, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { SettingsView, TelegramUserStorageReceipt } from '../shared/contracts'
+import type { SettingsView, TelegramUserStorageReceipt, UploadReceipt } from '../shared/contracts'
 import type { StorageBackend } from '../shared/storage-capabilities'
 import { ApiError, type WorkerApi } from './api'
 import { type LocalDb, type LocalFileRow, type PendingRow } from './db'
 import { assertSupportedFileSignature, isManagedFile, officeLockTargetPath, sha256File, waitForStableReadableFile } from './file-utils'
 import { ExcelWatcher } from './watcher'
+import { recoverInterruptedReplacements } from './interrupted-file-recovery'
 import type { DesktopStorageRouter } from './desktop-storage-router'
 import type { TelegramUserStorageProvider } from './telegram-user-storage'
 
 export interface SyncEngineCallbacks {
   onStateChanged?(): void
   canSyncCloud?(): Promise<boolean>
+}
+
+interface StableSnapshot {
+  hash: string
+  size: number
+  mtimeMs: number
 }
 
 function nextUtcDailyResetIso(): string {
@@ -31,6 +39,18 @@ function conflictName(path: string): string {
   return join(dirname(path), `${stem} (conflict ${stamp})${extension}`)
 }
 
+function uniqueConflictName(path: string): string {
+  const extension = extname(path)
+  const stem = basename(path, extension)
+  const now = new Date()
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0')
+  ].join('-') + ` ${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
+  return join(dirname(path), `${stem} (conflict ${stamp}-${randomUUID().slice(0, 8)})${extension}`)
+}
+
 export class SyncEngine {
   private watcher: ExcelWatcher
   private root = ''
@@ -38,15 +58,24 @@ export class SyncEngine {
   private remoteTimer: NodeJS.Timeout | null = null
   private pumping = false
   private readonly activeFiles = new Set<string>()
+  private readonly remotePullFiles = new Set<string>()
   private readonly activeJobs = new Map<string, Promise<void>>()
+  private readonly watcherWork = new Set<Promise<void>>()
   private readonly maxConcurrentJobs = 3
   private dispatchCounter = 0
+  private startupQueueDispatchBlocked = false
+  private initialRemoteBaselineListed = false
+  private startupBaselinePullPromise: Promise<void> | null = null
   private pullingRemote = false
+  private remotePullPromise: Promise<void> | null = null
+  private remotePullUnchangedStreak = 0
+  private nextRemotePullAt = 0
   private shutdownDraining = false
   private paused = false
   private stopped = true
   private cloudAccessEnabled = true
   private presenceTimer: NodeJS.Timeout | null = null
+  private presenceRefreshPromise: Promise<void> | null = null
   private readonly presenceFiles = new Map<string, 'OPEN' | 'EDITING'>()
   private readonly fileLeases = new Map<string, string>()
   private readonly priorityHints = new Map<string, { priority: number; expiresAt: number }>()
@@ -61,44 +90,85 @@ export class SyncEngine {
     private readonly telegramUser?: TelegramUserStorageProvider
   ) {
     this.watcher = new ExcelWatcher({
-      onFileReady: (path) => this.handleFileReady(path),
-      onFileDeleted: (path) => this.handleFileDeleted(path),
-      onOfficeLock: (path, active) => this.handleOfficeLock(path, active),
+      onFileReady: (path) => this.trackWatcherWork(path, () => this.handleFileReady(path)),
+      onFileDeleted: (path) => this.trackWatcherWork(path, () => this.handleFileDeleted(path)),
+      onOfficeLock: (path, active) => this.trackWatcherWork(path, () => this.handleOfficeLock(path, active)),
       onWatcherError: (error) => this.db.log('WATCHER_ERROR', null, error.message)
     })
+  }
+
+  private trackWatcherWork(path: string, run: () => Promise<void>): Promise<void> {
+    const work = Promise.resolve().then(run).catch((error) => {
+      if (!this.stopped) this.db.log('WATCHER_HANDLER_ERROR', null, `${path}: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    this.watcherWork.add(work)
+    void work.finally(() => this.watcherWork.delete(work))
+    return work
   }
 
   async start(settings: SettingsView): Promise<void> {
     this.stopped = false
     this.db.setSettings(settings)
     this.paused = !settings.autoSync
-    await this.setDirectory(settings.syncDirectory)
-    if (!this.timer) {
-      this.timer = setInterval(() => void this.processOne(), 2000)
-    }
-    if (!this.remoteTimer) {
-      // Remote reconciliation does not need sub-minute polling. Local filesystem
-      // changes are queued immediately by the watcher; a slower cloud poll avoids
-      // burning D1 reads/auth activity while the desktop is idle.
-      this.remoteTimer = setInterval(() => void this.pullRemoteChanges(), 60_000)
-    }
-    if (!this.presenceTimer) {
-      this.presenceTimer = setInterval(() => void this.refreshPresence(), 25_000)
-    }
-    if (!this.paused) {
-      void this.processOne()
-      void this.pullRemoteChanges()
+    this.startupQueueDispatchBlocked = !this.paused && this.cloudAccessEnabled && !this.initialRemoteBaselineListed
+    let initialPullStarted = false
+    try {
+      await this.setDirectory(settings.syncDirectory)
+      if (!this.timer) {
+        this.timer = setInterval(() => void this.processOne(), 2000)
+      }
+      if (!this.remoteTimer) {
+        // Remote reconciliation does not need sub-minute polling. Local filesystem
+        // changes are queued immediately by the watcher; a slower cloud poll avoids
+        // burning D1 reads/auth activity while the desktop is idle.
+        this.remoteTimer = setInterval(() => void this.pullRemoteChanges(), 60_000)
+      }
+      if (!this.presenceTimer) {
+        this.presenceTimer = setInterval(() => void this.refreshPresence(), 25_000)
+      }
+      if (!this.paused) {
+        initialPullStarted = true
+        if (this.cloudAccessEnabled && !this.initialRemoteBaselineListed) {
+          this.beginStartupBaselinePull()
+        } else {
+          void this.pullRemoteChanges(true)
+            .catch((error) => this.db.log('REMOTE_PULL_ERROR', null, error instanceof Error ? error.message : String(error)))
+            .finally(() => {
+              if (!this.paused && !this.stopped && this.cloudAccessEnabled) void this.processOne()
+            })
+        }
+      }
+    } finally {
+      if (!initialPullStarted) this.startupQueueDispatchBlocked = false
     }
   }
 
   async stop(): Promise<void> {
-    this.stopped = true
+    this.shutdownDraining = true
     if (this.timer) clearInterval(this.timer)
     if (this.remoteTimer) clearInterval(this.remoteTimer)
     if (this.presenceTimer) clearInterval(this.presenceTimer)
     this.timer = null
     this.remoteTimer = null
     this.presenceTimer = null
+    this.api.cancelRequests?.()
+    if (!this.stopped) {
+      await this.watcher.flushPending().catch((error) => {
+        this.db.log('WATCHER_FLUSH_ERROR', null, error instanceof Error ? error.message : String(error))
+      })
+    }
+    await this.watcher.stop().catch((error) => {
+      this.db.log('WATCHER_STOP_ERROR', null, error instanceof Error ? error.message : String(error))
+    })
+    await Promise.allSettled([...this.watcherWork])
+    this.stopped = true
+    await this.telegramUser?.stop().catch(() => undefined)
+    const inFlight = [
+      ...this.activeJobs.values(),
+      ...(this.remotePullPromise ? [this.remotePullPromise] : []),
+      ...(this.presenceRefreshPromise ? [this.presenceRefreshPromise] : [])
+    ]
+    await Promise.allSettled(inFlight)
     const activePresence = [...this.presenceFiles.keys()]
     const activeLeases = [...this.fileLeases.entries()]
     this.presenceFiles.clear()
@@ -107,7 +177,7 @@ export class SyncEngine {
       ...activeLeases.map(([fileId, leaseId]) => this.api.releaseFileLease(fileId, leaseId).catch(() => undefined)),
       ...activePresence.map((fileId) => this.api.clearFilePresence(fileId).catch(() => undefined))
     ])
-    await this.watcher.stop()
+    this.shutdownDraining = false
   }
 
   async setDirectory(directory: string): Promise<void> {
@@ -117,6 +187,14 @@ export class SyncEngine {
     this.root = next
     if (this.root) {
       await mkdir(this.root, { recursive: true })
+      await recoverInterruptedReplacements(this.root, {
+        knownSyncedHash: (path) => {
+          const file = this.db.getFileByPath(path)
+          return file && file.current_version > 0 && !this.db.hasPendingWorkForFile(file.id) ? file.current_hash : null
+        },
+        onRecovered: (path, action) => this.db.log('INTERRUPTED_REPLACEMENT_RECOVERED', null, `${action}: ${path}`),
+        onError: (path, error) => this.db.log('INTERRUPTED_REPLACEMENT_RECOVERY_ERROR', null, `${path}: ${error instanceof Error ? error.message : String(error)}`)
+      })
       await this.watcher.start(this.root)
       this.db.log('WATCHER_STARTED', null, this.root)
     }
@@ -127,8 +205,12 @@ export class SyncEngine {
     this.db.log(paused ? 'SYNC_PAUSED' : 'SYNC_RESUMED', null)
     this.callbacks.onStateChanged?.()
     if (!paused) {
-      void this.processOne()
-      void this.pullRemoteChanges()
+      if (this.cloudAccessEnabled && !this.initialRemoteBaselineListed) this.beginStartupBaselinePull()
+      else {
+        void this.pullRemoteChanges(true).finally(() => {
+          if (!this.paused && !this.stopped && this.cloudAccessEnabled) void this.processOne()
+        })
+      }
     }
   }
 
@@ -140,17 +222,37 @@ export class SyncEngine {
     this.cloudAccessEnabled = enabled
     if (!enabled) return
     if (!this.paused && !this.stopped) {
-      void this.processOne()
-      void this.pullRemoteChanges()
+      if (!this.initialRemoteBaselineListed) this.beginStartupBaselinePull()
+      else {
+        void this.pullRemoteChanges(true).finally(() => {
+          if (!this.paused && !this.stopped && this.cloudAccessEnabled) void this.processOne()
+        })
+      }
       void this.refreshPresence()
     }
   }
 
+  private beginStartupBaselinePull(): void {
+    if (this.startupBaselinePullPromise) return
+    this.startupQueueDispatchBlocked = true
+    const pull = this.pullRemoteChanges(true)
+      .catch((error) => this.db.log('REMOTE_PULL_ERROR', null, error instanceof Error ? error.message : String(error)))
+    let startupPull!: Promise<void>
+    startupPull = pull.finally(() => {
+      if (this.startupBaselinePullPromise !== startupPull) return
+      this.startupBaselinePullPromise = null
+      this.startupQueueDispatchBlocked = false
+      if (!this.paused && !this.stopped && this.cloudAccessEnabled) void this.processOne()
+    })
+    this.startupBaselinePullPromise = startupPull
+  }
+
   async noteFileOpened(fileId: string): Promise<void> {
-    if (!this.cloudAccessEnabled || this.paused || this.stopped) return
+    if (!this.cloudAccessEnabled || this.paused || this.stopped || this.shutdownDraining) return
     try {
       await this.api.setFilePresence(fileId, 'OPEN')
     } catch (error) {
+      if (this.stopped) return
       if (!(error instanceof ApiError) || !['AUTH_REQUIRED', 'INVALID_SESSION', 'DEVICE_REGISTRATION_REQUIRED'].includes(error.code)) {
         this.db.log('PRESENCE_OPEN_ERROR', fileId, error instanceof Error ? error.message : String(error))
       }
@@ -197,7 +299,18 @@ export class SyncEngine {
   }
 
   private async refreshPresence(): Promise<void> {
-    if (!this.cloudAccessEnabled || this.paused || this.stopped || this.presenceFiles.size === 0) return
+    if (!this.cloudAccessEnabled || this.paused || this.stopped || this.shutdownDraining || this.presenceFiles.size === 0) return
+    if (this.presenceRefreshPromise) return this.presenceRefreshPromise
+    const refresh = this.performPresenceRefresh()
+    this.presenceRefreshPromise = refresh
+    try {
+      await refresh
+    } finally {
+      if (this.presenceRefreshPromise === refresh) this.presenceRefreshPromise = null
+    }
+  }
+
+  private async performPresenceRefresh(): Promise<void> {
     for (const [fileId, state] of this.presenceFiles) {
       try {
         const leaseId = this.fileLeases.get(fileId)
@@ -426,7 +539,7 @@ export class SyncEngine {
     if (this.paused || this.stopped || !this.cloudAccessEnabled) return
     if (this.callbacks.canSyncCloud && !(await this.callbacks.canSyncCloud())) return
     this.db.boostReadyPending(1)
-    await this.pullRemoteChanges()
+    await this.pullRemoteChanges(true)
     for (let completed = 0; completed < 200; completed += 1) {
       await this.processOne()
       const active = [...this.activeJobs.values()]
@@ -437,7 +550,7 @@ export class SyncEngine {
       await Promise.race(active)
     }
     while (this.activeJobs.size > 0) await Promise.race([...this.activeJobs.values()])
-    await this.pullRemoteChanges()
+    await this.pullRemoteChanges(true)
   }
 
   async flushBeforeExit(maxWaitMs = 180_000): Promise<void> {
@@ -525,15 +638,55 @@ export class SyncEngine {
     return imported
   }
 
-  async pullRemoteChanges(): Promise<void> {
-    if (this.paused || this.stopped || !this.cloudAccessEnabled || this.pullingRemote || !this.root) return
+  private remoteMetadataMatches(local: LocalFileRow, input: {
+    relativePath: string
+    logicalName: string
+    extension: string
+    version: number
+    hash: string | null
+    cloudStatus: 'active' | 'trashed' | 'deleted'
+    storageBackend?: StorageBackend | null
+    storageLocator?: string | null
+  }): boolean {
+    const storageBackend = input.storageBackend ?? local.storage_backend ?? 'telegram_bot'
+    const storageLocator = input.storageLocator ?? local.storage_locator ?? null
+    return local.relative_path === input.relativePath &&
+      local.logical_name === input.logicalName &&
+      local.extension === input.extension &&
+      local.current_version === input.version &&
+      local.current_hash === input.hash &&
+      local.cloud_status === input.cloudStatus &&
+      (local.storage_backend ?? 'telegram_bot') === storageBackend &&
+      (local.storage_locator ?? null) === storageLocator
+  }
+
+  async pullRemoteChanges(force = false): Promise<void> {
+    if (this.paused || this.stopped || this.shutdownDraining || !this.cloudAccessEnabled || !this.root) return
+    if (this.remotePullPromise) return this.remotePullPromise
+    if (!force && Date.now() < this.nextRemotePullAt) return
     if (this.callbacks.canSyncCloud && !(await this.callbacks.canSyncCloud())) return
+    if (this.paused || this.stopped || this.shutdownDraining || !this.cloudAccessEnabled || !this.root) return
+    if (this.remotePullPromise) return this.remotePullPromise
+    if (!force && Date.now() < this.nextRemotePullAt) return
+
     this.pullingRemote = true
+    const pull = this.performRemotePull()
+    this.remotePullPromise = pull
+    try {
+      await pull
+    } finally {
+      if (this.remotePullPromise === pull) this.remotePullPromise = null
+    }
+  }
+
+  private async performRemotePull(): Promise<void> {
     let stateChanged = false
+    let pullFailed = false
     try {
       try {
-        await this.syncTelegramUserGroup()
+        if (await this.syncTelegramUserGroup() > 0) stateChanged = true
       } catch (error) {
+        pullFailed = true
         this.db.log('TELEGRAM_USER_CATCHUP_ERROR', null, error instanceof Error ? error.message : String(error))
       }
       try {
@@ -543,12 +696,19 @@ export class SyncEngine {
         if (!(error instanceof ApiError) || !['AUTH_REQUIRED', 'INVALID_SESSION', 'TELEGRAM_CHAT_NOT_CONNECTED'].includes(error.code)) {
           throw error
         }
-        if (error.code === 'AUTH_REQUIRED' || error.code === 'INVALID_SESSION') return
+        if (error.code === 'AUTH_REQUIRED' || error.code === 'INVALID_SESSION') {
+          pullFailed = true
+          return
+        }
       }
 
       const cloudFiles = await this.api.filesList()
+      this.initialRemoteBaselineListed = true
       for (const cloud of cloudFiles) {
         if (cloud.current_version <= 0) continue
+        this.remotePullFiles.add(cloud.id)
+        let occupiedFileId: string | null = null
+        try {
         const relativePath = cloud.relative_path.replaceAll('\\', '/').replace(/^\/+/, '')
         const segments = relativePath.split('/')
         if (!relativePath || segments.some((part) => !part || part === '.' || part === '..') || !isManagedFile(relativePath)) {
@@ -563,8 +723,18 @@ export class SyncEngine {
         }
 
         let local = this.db.getFile(cloud.id)
+        if (local && this.db.hasPendingWorkForFile(local.id)) continue
         if (cloud.status !== 'active') {
-          if (local) {
+          if (local && !this.remoteMetadataMatches(local, {
+            relativePath,
+            logicalName: basename(relativePath),
+            extension: extname(relativePath).toLowerCase(),
+            version: cloud.current_version,
+            hash: cloud.current_hash,
+            cloudStatus: cloud.status,
+            storageBackend: cloud.current_storage_backend,
+            storageLocator: cloud.current_storage_locator
+          })) {
             this.db.upsertRemoteMetadata({
               id: cloud.id,
               relativePath,
@@ -612,8 +782,7 @@ export class SyncEngine {
             }
           }
           if (state?.exists_flag === 0) {
-            this.db.upsertRemoteMetadata({
-              id: cloud.id,
+            if (!this.remoteMetadataMatches(local, {
               relativePath,
               logicalName: basename(relativePath),
               extension: extname(relativePath).toLowerCase(),
@@ -622,52 +791,264 @@ export class SyncEngine {
               cloudStatus: 'active',
               storageBackend: cloud.current_storage_backend,
               storageLocator: cloud.current_storage_locator
-            })
+            })) {
+              this.db.upsertRemoteMetadata({
+                id: cloud.id,
+                relativePath,
+                logicalName: basename(relativePath),
+                extension: extname(relativePath).toLowerCase(),
+                version: cloud.current_version,
+                hash: cloud.current_hash,
+                cloudStatus: 'active',
+                storageBackend: cloud.current_storage_backend,
+                storageLocator: cloud.current_storage_locator
+              })
+              stateChanged = true
+            }
             continue
           }
           if (local.current_version >= cloud.current_version && local.current_hash === cloud.current_hash) continue
         }
         const occupied = this.db.getFileByPath(relativePath)
         if (occupied && occupied.id !== cloud.id) {
+          const occupiedState = this.db.getState(occupied.id)
+          const cloudHash = cloud.current_hash?.toLowerCase() ?? null
+          if (
+            occupied.current_version === 0 &&
+            occupied.cloud_status === 'active' &&
+            occupiedState?.exists_flag === 1 &&
+            cloudHash
+          ) {
+            occupiedFileId = occupied.id
+            this.remotePullFiles.add(occupiedFileId)
+            const fresh = await this.stableSnapshot(absolutePath)
+            const latestOccupied = this.db.getFileByPath(relativePath)
+            const latestState = latestOccupied ? this.db.getState(latestOccupied.id) : null
+            if (
+              fresh?.hash === cloudHash &&
+              latestOccupied?.id === occupied.id &&
+              latestOccupied.current_version === 0 &&
+              latestOccupied.cloud_status === 'active' &&
+              latestState?.exists_flag === 1
+            ) {
+              try {
+                this.db.adoptRemoteBaseline(occupied.id, {
+                  id: cloud.id,
+                  relativePath,
+                  logicalName: basename(relativePath),
+                  extension: extname(relativePath).toLowerCase(),
+                  version: cloud.current_version,
+                  hash: cloudHash,
+                  size: fresh.size,
+                  mtimeMs: fresh.mtimeMs,
+                  storageBackend: cloud.current_storage_backend,
+                  storageLocator: cloud.current_storage_locator
+                })
+                stateChanged = true
+                continue
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                if (!['LOCAL_BASELINE_NOT_ADOPTABLE', 'LOCAL_BASELINE_PATH_MISMATCH', 'LOCAL_BASELINE_HAS_PENDING_WORK', 'REMOTE_BASELINE_ALREADY_EXISTS'].includes(message)) {
+                  throw error
+                }
+              }
+            }
+          }
           this.db.log('REMOTE_PATH_CONFLICT', cloud.id, `${relativePath} occupied by ${occupied.id}`)
           continue
         }
 
-        this.suppress(absolutePath, 3500)
-        const remote = await this.downloadCurrentTo(cloud.id, absolutePath)
-        const info = await stat(absolutePath)
-        const hash = remote.hash ?? (await sha256File(absolutePath))
-        this.db.upsertRemoteFile({
-          id: cloud.id,
-          relativePath,
-          logicalName: basename(relativePath),
-          extension: extname(relativePath).toLowerCase(),
-          version: remote.version || cloud.current_version,
-          hash,
-          size: info.size,
-          mtimeMs: info.mtimeMs,
-          storageBackend: remote.backend,
-          storageLocator: remote.locator ?? cloud.current_storage_locator
-        })
-        stateChanged = true
+        const before = await this.stableSnapshot(absolutePath)
+        const cloudHash = cloud.current_hash?.toLowerCase() ?? null
+        if (before) {
+          if (cloudHash && before.hash === cloudHash) {
+            this.db.upsertRemoteFile({
+              id: cloud.id,
+              relativePath,
+              logicalName: basename(relativePath),
+              extension: extname(relativePath).toLowerCase(),
+              version: cloud.current_version,
+              hash: before.hash,
+              size: before.size,
+              mtimeMs: before.mtimeMs,
+              storageBackend: cloud.current_storage_backend,
+              storageLocator: cloud.current_storage_locator
+            })
+            stateChanged = true
+            continue
+          }
+          const expectedHash = local?.current_hash ?? this.db.getState(cloud.id)?.last_hash
+          if (!expectedHash || before.hash !== expectedHash.toLowerCase()) {
+            await this.handleFileReady(absolutePath)
+            continue
+          }
+        }
+
+        const extension = extname(absolutePath)
+        const stagePath = join(dirname(absolutePath), `~$${basename(absolutePath, extension)}.excelsync-${randomUUID()}${extension}`)
+        try {
+          const remote = await this.downloadCurrentTo(cloud.id, stagePath)
+          const staged = await this.stableSnapshot(stagePath)
+          if (!staged) throw new Error('REMOTE_DOWNLOAD_MISSING')
+          if (remote.hash && staged.hash !== remote.hash.toLowerCase()) throw new Error('DOWNLOAD_HASH_MISMATCH')
+          const installed = await this.installRemoteStage(absolutePath, stagePath, before)
+          if (!installed) continue
+          this.suppress(absolutePath, 3500)
+          this.db.upsertRemoteFile({
+            id: cloud.id,
+            relativePath,
+            logicalName: basename(relativePath),
+            extension: extension.toLowerCase(),
+            version: remote.version || cloud.current_version,
+            hash: staged.hash,
+            size: staged.size,
+            mtimeMs: staged.mtimeMs,
+            storageBackend: remote.backend,
+            storageLocator: remote.locator ?? cloud.current_storage_locator
+          })
+          stateChanged = true
+        } finally {
+          await rm(stagePath, { force: true }).catch(() => undefined)
+        }
+        } finally {
+          this.remotePullFiles.delete(cloud.id)
+          if (occupiedFileId) this.remotePullFiles.delete(occupiedFileId)
+        }
       }
       if (stateChanged) this.callbacks.onStateChanged?.()
     } catch (error) {
+      pullFailed = true
       if (error instanceof ApiError && (error.code === 'AUTH_REQUIRED' || error.code === 'INVALID_SESSION')) return
       this.db.log('REMOTE_PULL_ERROR', null, error instanceof Error ? error.message : String(error))
     } finally {
+      this.remotePullUnchangedStreak = stateChanged ? 0 : Math.min(3, this.remotePullUnchangedStreak + 1)
+      const delayMs = Math.min(5 * 60_000, 60_000 * 2 ** this.remotePullUnchangedStreak)
+      this.nextRemotePullAt = Date.now() + delayMs
+      if (pullFailed) this.db.log('REMOTE_PULL_BACKOFF', null, `next pull in ${Math.round(delayMs / 1000)}s`)
       this.pullingRemote = false
     }
   }
 
+  private async stableSnapshot(path: string): Promise<StableSnapshot | null> {
+    try {
+      const stable = await waitForStableReadableFile(path)
+      const hash = await sha256File(path)
+      const info = await stat(path)
+      if (info.size !== stable.size || info.mtimeMs !== stable.mtimeMs) throw new Error('FILE_CHANGED_DURING_HASH')
+      return { hash: hash.toLowerCase(), size: info.size, mtimeMs: info.mtimeMs }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
+  private async pathExists(path: string): Promise<boolean> {
+    try {
+      return (await stat(path)).isFile()
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    }
+  }
+
+  private async finishDisplacedFile(path: string, displaced: string, expectedHash: string, remoteInstalled: boolean): Promise<void> {
+    let snapshot: StableSnapshot | null
+    try {
+      snapshot = await this.stableSnapshot(displaced)
+    } catch {
+      snapshot = null
+      if (await this.pathExists(displaced)) {
+        const conflictPath = uniqueConflictName(path)
+        await rename(displaced, conflictPath)
+        await this.handleFileReady(conflictPath)
+      }
+      return
+    }
+    if (!snapshot) return
+    const targetExists = await this.pathExists(path)
+    if (snapshot.hash !== expectedHash) {
+      if (!targetExists && !remoteInstalled) {
+        await rename(displaced, path)
+        await this.handleFileReady(path)
+        return
+      }
+      const conflictPath = uniqueConflictName(path)
+      await rename(displaced, conflictPath)
+      await this.handleFileReady(conflictPath)
+      return
+    }
+    if (!targetExists && !remoteInstalled) {
+      await rename(displaced, path)
+      return
+    }
+    await rm(displaced, { force: true })
+  }
+
+  private async installRemoteStage(path: string, stagePath: string, before: StableSnapshot | null): Promise<boolean> {
+    const current = await this.stableSnapshot(path)
+    if ((before?.hash ?? null) !== (current?.hash ?? null)) {
+      if (current) await this.handleFileReady(path)
+      else if (before) await this.handleFileDeleted(path)
+      return false
+    }
+
+    let displaced = ''
+    if (before) {
+      displaced = `${path}.excelsync-displaced-${randomUUID()}.tmp`
+      try {
+        await rename(path, displaced)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          await this.handleFileDeleted(path)
+          return false
+        }
+        throw error
+      }
+      let moved: StableSnapshot | null
+      try {
+        moved = await this.stableSnapshot(displaced)
+      } catch {
+        await this.finishDisplacedFile(path, displaced, before.hash, false)
+        return false
+      }
+      if (!moved || moved.hash !== before.hash) {
+        await this.finishDisplacedFile(path, displaced, before.hash, false)
+        if (await this.pathExists(path)) await this.handleFileReady(path)
+        return false
+      }
+      if (await this.pathExists(path)) {
+        await this.finishDisplacedFile(path, displaced, before.hash, false)
+        await this.handleFileReady(path)
+        return false
+      }
+    }
+
+    try {
+      // link() is an atomic create-if-absent on the same volume. It cannot replace
+      // a file created by Excel after the last stability check.
+      await link(stagePath, path)
+    } catch (error) {
+      if (displaced) await this.finishDisplacedFile(path, displaced, before!.hash, false)
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        await this.handleFileReady(path)
+        return false
+      }
+      throw error
+    }
+    await rm(stagePath, { force: true })
+    if (displaced) await this.finishDisplacedFile(path, displaced, before!.hash, true)
+    return true
+  }
+
   private async processOne(): Promise<void> {
-    if (this.pumping || this.paused || this.stopped || !this.cloudAccessEnabled || this.shutdownDraining) return
+    if (this.startupQueueDispatchBlocked || this.pumping || this.paused || this.stopped || !this.cloudAccessEnabled || this.shutdownDraining) return
     if (this.callbacks.canSyncCloud && !(await this.callbacks.canSyncCloud())) return
+    if (this.startupQueueDispatchBlocked || this.pumping || this.paused || this.stopped || !this.cloudAccessEnabled || this.shutdownDraining) return
     this.pumping = true
     try {
       while (this.activeJobs.size < this.maxConcurrentJobs) {
         this.dispatchCounter += 1
-        const pending = this.db.nextReadyPending([...this.activeFiles], this.dispatchCounter % 10 === 0)
+        const pending = this.db.nextReadyPending([...this.activeFiles, ...this.remotePullFiles], this.dispatchCounter % 10 === 0)
         if (!pending) break
         this.activeFiles.add(pending.file_id)
         this.db.markUploading(pending.id)
@@ -706,6 +1087,41 @@ export class SyncEngine {
     let pending = initialPending
     const file = this.db.getFile(pending.file_id)
     if (!file) throw new Error('LOCAL_FILE_RECORD_MISSING')
+
+    // Receipt recovery belongs to the original bytes/intent. A subsequent save,
+    // rename or removal must never discard that proof or send those bytes again.
+    if (pending.upload_receipt) {
+      const receipt = this.savedReceipt(pending)
+      let intentId: string | undefined = receipt.backend === 'telegram_bot' ? receipt.intentId : undefined
+      if (!intentId) {
+        try { intentId = JSON.parse(pending.retry_state ?? 'null')?.intentId } catch { /* Legacy receipt. */ }
+      }
+      if (!intentId) {
+        const preflight = await this.api.preflight({
+          fileId: file.id, logicalName: file.logical_name, relativePath: file.relative_path,
+          hash: receipt.sha256, size: receipt.size, baseVersion: pending.base_version,
+          idempotencyKey: pending.idempotency_key, storageBackend: receipt.backend,
+          restoredFromVersion: pending.restored_from_version
+        })
+        if (preflight.action === 'noop' || preflight.action === 'committed') {
+          await this.completeUpload(pending, preflight.currentVersion, preflight.currentHash)
+          return
+        }
+        if (preflight.action === 'conflict') {
+          await this.createConflict(pending, file, `Cloud advanced to V${preflight.currentVersion}`)
+          return
+        }
+        intentId = preflight.intentId
+        this.db.setUploadReceipt(pending.id, receipt, intentId)
+      }
+      this.callbacks.onStateChanged?.()
+      await this.api.recordUploadReceipt(intentId, receipt)
+      const committed = await this.api.commit(intentId)
+      await this.completeUpload(pending, committed.version, committed.hash)
+      return
+    }
+    this.db.setRetryState(pending.id, { stage: 'checking' })
+    this.callbacks.onStateChanged?.()
 
     const cachedState = this.db.getState(file.id)
     const canReuseVerifiedSnapshot = Boolean(
@@ -749,7 +1165,7 @@ export class SyncEngine {
     }
     if (!pending.hash || pending.size === null) throw new Error('PENDING_UPLOAD_INVALID')
     if (currentHash !== pending.hash || stable.size !== pending.size) {
-      this.db.cancelPending(file.id)
+      this.db.discardUnuploadedPending(pending.id)
       await this.handleFileReady(pending.local_path)
       return
     }
@@ -783,51 +1199,77 @@ export class SyncEngine {
       if (reusedVerifiedSnapshot) {
         const verifiedHash = await sha256File(pending.local_path)
         if (verifiedHash !== pending.hash) {
-          this.db.cancelPending(file.id)
+          this.db.discardUnuploadedPending(pending.id)
           await this.handleFileReady(pending.local_path)
           return
         }
       }
-      this.db.markSynced(pending.id, preflight.currentVersion, preflight.currentHash, pending.size)
-      this.db.rebaseQueuedForFile(file.id, preflight.currentVersion)
+      await this.completeUpload(pending, preflight.currentVersion, preflight.currentHash)
       return
     }
 
     const intentId = preflight.intentId
     if (preflight.action === 'upload_required') {
-      let receipt: TelegramUserStorageReceipt | null = null
-      if (pending.upload_receipt) {
-        try {
-          receipt = JSON.parse(pending.upload_receipt) as TelegramUserStorageReceipt
-        } catch {
-          this.db.clearUploadReceipt(pending.id)
-        }
-      }
+      let receipt: UploadReceipt | null = null
+      this.db.setRetryState(pending.id, { stage: 'uploading', intentId })
+      this.callbacks.onStateChanged?.()
       if (!receipt) {
         if (!this.storage) {
           if (pending.storage_backend === 'telegram_user_group') throw new Error('TELEGRAM_USER_STORAGE_UNAVAILABLE')
-          await this.api.upload(intentId, pending.local_path)
+          receipt = await this.api.upload(intentId, pending.local_path) ?? null
         } else {
           receipt = await this.storage.upload(pending.storage_backend, pending.local_path, pending.hash)
-          if (receipt) this.db.setUploadReceipt(pending.id, receipt)
-          else await this.api.upload(intentId, pending.local_path)
+          if (!receipt) receipt = await this.api.upload(intentId, pending.local_path) ?? null
         }
       }
       if (receipt) {
-        this.db.rememberTelegramUpload({
-          chatId: receipt.chatId,
-          messageId: receipt.messageId,
-          fileName: receipt.fileName,
-          size: receipt.size,
-          relativePath: file.relative_path,
-          sha256: receipt.sha256
-        })
+        this.db.setUploadReceipt(pending.id, receipt, intentId)
+        this.savedReceipt(this.db.getPending(pending.id)!)
+        this.callbacks.onStateChanged?.()
+        if (receipt.backend === 'telegram_user_group') {
+          this.db.rememberTelegramUpload({
+            chatId: receipt.chatId, messageId: receipt.messageId, fileName: receipt.fileName,
+            size: receipt.size, relativePath: file.relative_path, sha256: receipt.sha256
+          })
+        }
         await this.api.recordUploadReceipt(intentId, receipt)
       }
     }
+    this.db.setRetryState(pending.id, { stage: 'commit_pending', intentId })
+    this.callbacks.onStateChanged?.()
     const committed = await this.api.commit(intentId)
-    this.db.markSynced(pending.id, committed.version, committed.hash, pending.size)
-    this.db.rebaseQueuedForFile(file.id, committed.version)
+    await this.completeUpload(pending, committed.version, committed.hash)
+  }
+
+  private savedReceipt(pending: PendingRow): UploadReceipt {
+    let receipt: UploadReceipt
+    try { receipt = JSON.parse(pending.upload_receipt ?? '') as UploadReceipt } catch {
+      throw new ApiError('INVALID_UPLOAD_RECEIPT', 422, false)
+    }
+    if (!receipt || receipt.backend !== pending.storage_backend || receipt.sha256 !== pending.hash || receipt.size !== pending.size ||
+        (receipt.backend === 'telegram_bot' ? !receipt.intentId || !receipt.recoveryToken : !receipt.chatId || !Number.isSafeInteger(receipt.messageId) || receipt.messageId <= 0)) {
+      throw new ApiError('INVALID_UPLOAD_RECEIPT', 422, false)
+    }
+    return receipt
+  }
+
+  private async completeUpload(pending: PendingRow, version: number, hash: string): Promise<void> {
+    if (!pending.hash || pending.size === null || hash.toLowerCase() !== pending.hash.toLowerCase()) {
+      throw new ApiError('COMMIT_HASH_MISMATCH', 422, false)
+    }
+    this.db.markSynced(pending.id, version, hash, pending.size)
+    this.db.rebaseQueuedForFile(pending.file_id, version)
+    try {
+      const info = await stat(pending.local_path)
+      const currentHash = await sha256File(pending.local_path)
+      if (currentHash !== hash) await this.handleFileReady(pending.local_path)
+      else this.db.upsertState(pending.file_id, info.size, info.mtimeMs, currentHash, true)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        const file = this.db.getFile(pending.file_id)
+        if (file) this.db.markMissing(file.relative_path)
+      } else throw error
+    }
   }
 
   private async processRename(pending: PendingRow): Promise<void> {
@@ -999,17 +1441,35 @@ export class SyncEngine {
   async trashSaasFile(fileId: string): Promise<void> {
     const file = this.db.getFile(fileId)
     if (!file || file.current_version <= 0 || file.cloud_status !== 'active') throw new Error('CLOUD_FILE_NOT_AVAILABLE')
-    await this.api.trashFile(file.id, file.current_version)
-    this.db.markCloudTrashed(file.id)
-    this.callbacks.onStateChanged?.()
+    if (this.db.hasPendingWorkForFile(file.id) || this.activeFiles.has(file.id) || this.remotePullFiles.has(file.id)) {
+      throw new Error('FILE_HAS_PENDING_SYNC')
+    }
+    this.activeFiles.add(file.id)
+    try {
+      await this.api.trashFile(file.id, file.current_version)
+      this.db.markCloudTrashed(file.id)
+      this.callbacks.onStateChanged?.()
+    } finally {
+      this.activeFiles.delete(file.id)
+      if (!this.paused && !this.stopped && this.cloudAccessEnabled) setTimeout(() => void this.processOne(), 25)
+    }
   }
 
   async permanentlyDelete(fileId: string): Promise<void> {
     const file = this.db.getFile(fileId)
     if (!file || file.cloud_status !== 'trashed') throw new Error('FILE_NOT_TRASHED')
-    await this.api.permanentlyDelete(fileId)
-    this.db.markCloudDeleted(fileId)
-    this.callbacks.onStateChanged?.()
+    if (this.db.hasPendingWorkForFile(file.id) || this.activeFiles.has(file.id) || this.remotePullFiles.has(file.id)) {
+      throw new Error('FILE_HAS_PENDING_SYNC')
+    }
+    this.activeFiles.add(file.id)
+    try {
+      await this.api.permanentlyDelete(fileId)
+      this.db.markCloudDeleted(fileId)
+      this.callbacks.onStateChanged?.()
+    } finally {
+      this.activeFiles.delete(file.id)
+      if (!this.paused && !this.stopped && this.cloudAccessEnabled) setTimeout(() => void this.processOne(), 25)
+    }
   }
 
   async restoreTrash(fileId: string): Promise<void> {
